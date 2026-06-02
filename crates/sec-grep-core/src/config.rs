@@ -25,10 +25,6 @@ pub struct Venue {
     pub tags: Vec<String>,
     #[serde(default)]
     pub abstract_source: Option<AbstractSource>,
-    /// dblp publication type for this stream (`Inproceedings` for conferences,
-    /// `Article` for journals like PoPETs).
-    #[serde(default = "default_publ_type")]
-    pub publ_type: DblpPublicationType,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -39,26 +35,6 @@ pub enum AbstractSource {
     Ndss,
     Springer,
     Usenix,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "PascalCase")]
-pub enum DblpPublicationType {
-    Inproceedings,
-    Article,
-}
-
-impl DblpPublicationType {
-    pub fn as_dblp_type(self) -> &'static str {
-        match self {
-            DblpPublicationType::Inproceedings => "Inproceedings",
-            DblpPublicationType::Article => "Article",
-        }
-    }
-}
-
-fn default_publ_type() -> DblpPublicationType {
-    DblpPublicationType::Inproceedings
 }
 
 impl Venue {
