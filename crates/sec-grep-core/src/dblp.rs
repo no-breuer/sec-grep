@@ -49,11 +49,13 @@ SELECT ?publ ?title ?year ?ordinal ?author ?url WHERE {{
   ?publ dblp:publishedInStream <https://dblp.org/streams/{stream}> ;
         rdf:type dblp:{publ_type} ;
         dblp:title ?title ;
-        dblp:yearOfPublication ?year ;
+        dblp:yearOfPublication ?pubYear ;
         dblp:hasSignature ?sig .
   ?sig dblp:signatureDblpName ?author ;
        dblp:signatureOrdinal ?ordinal .
   OPTIONAL {{ ?publ dblp:primaryDocumentPage ?url . }}
+  OPTIONAL {{ ?publ dblp:yearOfEvent ?eventYear . }}
+  BIND(COALESCE(?eventYear, ?pubYear) AS ?year)
   FILTER(?year >= "{min_year}"^^xsd:gYear && ?year <= "{max_year}"^^xsd:gYear)
 }}
 ORDER BY ?publ xsd:integer(?ordinal)"#,
@@ -231,6 +233,12 @@ mod tests {
         assert!(q.contains("rdf:type dblp:Inproceedings"));
         assert!(q.contains("\"2000\"^^xsd:gYear"));
         assert!(q.contains("\"2025\"^^xsd:gYear"));
+    }
+
+    #[test]
+    fn query_gives_event_year_precedence_over_publication_year() {
+        let q = build_query("conf/esorics", 2000, 2025).unwrap();
+        assert!(q.contains("COALESCE(?eventYear, ?pubYear) AS ?year"));
     }
 
     #[test]
