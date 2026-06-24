@@ -16,7 +16,6 @@ sec-grep-core = { version = "0.1.0", path = "../sec-grep-core" }
 clap.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
-futures.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 ratatui.workspace = true

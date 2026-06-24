@@ -1,12 +1,11 @@
 mod tui;
 
-use std::{io::Write, path::PathBuf};
+use std::{collections::BTreeMap, io::Write, path::PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use futures::stream::{self, StreamExt};
 
-use sec_grep_core::abstracts::Enricher;
+use sec_grep_core::abstracts::{EnrichResult, Enricher};
 use sec_grep_core::config::{Config, Paths, Secrets};
 use sec_grep_core::db::{Database, Search, Sort};
 use sec_grep_core::dblp::Dblp;
@@ -102,6 +101,7 @@ enum Command {
 const DEFAULT_JOBS: usize = 8;
 const MIN_ENRICH_BATCH: usize = 64;
 const MAX_ENRICH_BATCH: usize = 512;
+const ENRICH_PROGRESS_INTERVAL: usize = 500;
 
 #[derive(clap::Args)]
 struct UpdateArgs {
@@ -409,20 +409,22 @@ async fn enrich_abstracts(
     jobs: usize,
     limit: Option<usize>,
 ) -> Result<()> {
-    let enricher = Enricher::new(Secrets::load());
+    let mut enricher = Enricher::new(Secrets::load());
     let pending = db.count_missing_abstracts(venue_ids)?;
     let total = limit.map_or(pending, |limit| limit.min(pending));
     let jobs = jobs.max(1);
     let batch_size = enrich_batch_size(jobs);
     log_header("abstract enrichment");
-    log_field("pending", format_args!("{total} abstracts"));
+    log_field("pending", format_args!("{pending} abstracts"));
+    if total != pending {
+        log_field("selected", format_args!("{total} abstracts"));
+    }
     log_field("jobs", jobs);
-    log_field("strategy", "DOI APIs, then static scrape");
     log_blank();
 
-    let enricher = &enricher;
     let mut filled = 0usize;
     let mut processed = 0usize;
+    let mut misses: BTreeMap<String, usize> = BTreeMap::new();
     let mut after_id = 0;
     while processed < total {
         let remaining = total - processed;
@@ -433,35 +435,52 @@ async fn enrich_abstracts(
         };
         after_id = next_after_id;
 
-        let mut stream = stream::iter(batch.into_iter().map(|missing| async move {
-            let paper = missing.paper;
-            let source = config.venue(&paper.venue).and_then(|v| v.abstract_source);
-            let dblp_key = paper.dblp_key.clone();
-            (dblp_key, enricher.enrich(&paper, source).await)
-        }))
-        .buffer_unordered(jobs);
+        let inputs = batch
+            .into_iter()
+            .map(|missing| {
+                let paper = missing.paper;
+                let source = config.venue(&paper.venue).and_then(|v| v.abstract_source);
+                (paper, source)
+            })
+            .collect::<Vec<_>>();
 
-        while let Some((dblp_key, res)) = stream.next().await {
+        let (results, source_warnings) = enricher.enrich_many(inputs, jobs).await;
+        for warning in source_warnings {
+            log_field("warning", warning);
+        }
+
+        let mut abstract_updates = Vec::new();
+        for (paper, res) in results {
             processed += 1;
+            let dblp_key = paper.dblp_key;
             match res {
-                Ok(Some(abs)) => {
-                    db.set_abstract(&dblp_key, &abs)?;
+                Ok(EnrichResult::Found(abs)) => {
+                    abstract_updates.push((dblp_key, abs));
                     filled += 1;
                 }
-                Ok(None) => {}
+                Ok(EnrichResult::Missing(reason)) => {
+                    *misses.entry(reason).or_default() += 1;
+                }
                 Err(e) => tracing::warn!("abstract fetch failed for {dblp_key}: {e}"),
             }
-            if processed % 25 == 0 {
+            if processed % ENRICH_PROGRESS_INTERVAL == 0 {
                 log_field(
                     "progress",
                     format_args!("{processed}/{total} processed, {filled} filled"),
                 );
             }
         }
+        db.set_abstracts(&abstract_updates)?;
     }
     log_blank();
     log_header("summary");
-    log_field("filled", format_args!("{filled}/{total} abstracts"));
+    log_field("filled", format_args!("{filled}/{processed} abstracts"));
+    if !misses.is_empty() {
+        log_field("missed", processed - filled);
+        for (reason, count) in misses {
+            eprintln!("  {count:>10} {reason}");
+        }
+    }
     Ok(())
 }
 

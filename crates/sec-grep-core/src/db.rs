@@ -163,12 +163,20 @@ impl Database {
         Ok(n)
     }
 
-    /// Update only the abstract for a given dblp key.
-    pub fn set_abstract(&mut self, dblp_key: &str, abstract_text: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE papers SET abstract = ?2, updated_at = datetime('now') WHERE dblp_key = ?1",
-            rusqlite::params![dblp_key, abstract_text],
-        )?;
+    pub fn set_abstracts(&mut self, abstracts: &[(String, String)]) -> Result<()> {
+        if abstracts.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE papers SET abstract = ?2, updated_at = datetime('now') WHERE dblp_key = ?1",
+            )?;
+            for (dblp_key, abstract_text) in abstracts {
+                stmt.execute(rusqlite::params![dblp_key, abstract_text])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -691,13 +699,13 @@ mod tests {
     }
 
     #[test]
-    fn set_abstract_updates_fts() {
+    fn set_abstracts_updates_fts() {
         let mut db = seeded();
-        db.set_abstract("k2", "a microarchitectural timing leak")
+        db.set_abstracts(&[("k2".into(), "a batched cache timing leak".into())])
             .unwrap();
         let hits = db
             .search(&Search {
-                fts: Some("microarchitectural".into()),
+                fts: Some("batched".into()),
                 ..Default::default()
             })
             .unwrap();
