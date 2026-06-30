@@ -1,0 +1,26 @@
+# Machine learning venues bundled with sec-grep.
+
+venues:
+  - id: NeurIPS
+    name: Conference on Neural Information Processing Systems
+    dblp_stream: conf/nips
+    aliases: [neurips, nips]
+    rank: A*
+    tags: [ml, evaluation, datasets, benchmarks]
+    abstract_source: neurips
+
+  - id: ICML
+    name: International Conference on Machine Learning
+    dblp_stream: conf/icml
+    aliases: [icml]
+    rank: A*
+    tags: [ml, evaluation, robustness, interpretability]
+    abstract_source: pmlr
+
+  - id: ICLR
+    name: International Conference on Learning Representations
+    dblp_stream: conf/iclr
+    aliases: [iclr]
+    rank: A*
+    tags: [representation-learning, ml, evaluation, interpretability]
+    abstract_source: openreview

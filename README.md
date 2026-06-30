@@ -1,6 +1,6 @@
 # sec-grep
 
-Fast, local search across security and ML research literature.
+Fast, local search across computer science research literature.
 
 ![sec-grep TUI](assets/tui.png)
 
@@ -10,7 +10,7 @@ authors, abstract, venue, year, rank, tag, and DOI.
 
 ## Why
 
-- Search security, AI-security, and ML venues with a configurable catalog.
+- Search across configurable computer science venue catalogs.
 - Keep the corpus local and query it quickly with SQLite/FTS5.
 - Search in the CLI or TUI, and export CSV, JSON, or BibTeX for scripts.
 
@@ -117,29 +117,29 @@ sec-grep 'malware OR botnet' --year 2018 --year 2029
 sec-grep 'malware OR botnet' --rank A --tag systems
 ```
 
-The bundled catalog uses `--tag security` for traditional security venues,
-`--tag ml` for ML venues, and `--tag ai-security` for AI/ML-security crossover
-venues such as AISec and SaTML.
+Bundles select venue sets for subfields such as security, ML, and software
+engineering. Tags filter papers within the indexed corpus.
 
 ## Venues
 
-The bundled venue catalog lives in `crates/sec-grep-core/venues.yaml`. It
-defines each venue's display name, DBLP stream, aliases, rank, tags, and
-abstract parser hint.
+Bundled venue catalogs live in `crates/sec-grep-core/venues/`.
 
 After `sec-grep init`, you can extend or override the catalog with a user
-`venues.yaml`:
+`config.yaml`:
 
-- macOS: `~/Library/Application Support/sec-grep/venues.yaml`
-- Linux: `~/.config/sec-grep/venues.yaml`
-- Windows: `%APPDATA%\sec-grep\venues.yaml`
+- macOS: `~/Library/Application Support/sec-grep/config.yaml`
+- Linux: `~/.config/sec-grep/config.yaml`
+- Windows: `%APPDATA%\sec-grep\config.yaml`
 
-You can also pass a specific file with `--config path/to/venues.yaml`.
+You can also pass a specific file with `--config path/to/config.yaml`.
 
-User venues are merged by `id`: reuse an existing `id` to override a bundled
-venue, or add a new `id` to extend the catalog.
+`bundles` selects bundled venue sets for subfields. User venues are always
+merged after selected bundles by `id`: reuse an existing `id` to override a
+bundled venue, or add a new `id` to extend the catalog.
 
 ```yaml
+bundles: [security, ml, se]
+
 defaults:
   min_year: 2018
 

@@ -16,7 +16,11 @@ use sec_grep_core::query;
 const MAX_YEAR: i32 = 2100;
 
 #[derive(Parser)]
-#[command(name = "sec-grep", about = "Search security and ML papers", version)]
+#[command(
+    name = "sec-grep",
+    about = "Search computer science research literature",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -67,7 +71,7 @@ struct Cli {
     #[arg(long, global = true)]
     db: Option<PathBuf>,
 
-    /// Override user venues.yaml path.
+    /// Override user config.yaml path.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 }
@@ -220,7 +224,7 @@ fn load_config(cli: &Cli, paths: &Paths) -> Result<Config> {
 fn config_path(cli: &Cli, paths: &Paths) -> PathBuf {
     cli.config
         .clone()
-        .unwrap_or_else(|| paths.user_venues_path())
+        .unwrap_or_else(|| paths.user_config_path())
 }
 
 fn db_path(cli: &Cli, paths: &Paths) -> PathBuf {

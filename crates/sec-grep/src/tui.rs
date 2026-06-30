@@ -869,6 +869,7 @@ mod tests {
 
     fn config_with_ranks(ranks: &[(&str, &str)]) -> Config {
         Config {
+            bundles: Vec::new(),
             defaults: Defaults::default(),
             venues: ranks
                 .iter()
