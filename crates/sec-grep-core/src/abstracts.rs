@@ -8,7 +8,7 @@
 //! orchestration is exercised end-to-end via the CLI.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{HashMap, HashSet},
     net::IpAddr,
     sync::OnceLock,
     time::Duration,
@@ -19,7 +19,7 @@ use reqwest::{header, Url};
 use scraper::{ElementRef, Html, Selector};
 use serde_json::Value;
 
-use crate::config::{AbstractSource, Secrets};
+use crate::config::Secrets;
 use crate::{Paper, Result};
 
 const MAX_JSON_BODY_BYTES: usize = 4 * 1024 * 1024;
@@ -28,6 +28,18 @@ const MAX_STATIC_REDIRECTS: usize = 5;
 const MAX_RATE_LIMIT_SLEEP: Duration = Duration::from_secs(65);
 const OPENREVIEW_PAGE_SIZE: usize = 500;
 const OPENREVIEW_LOGIN_EXPIRES_IN: u64 = 7 * 24 * 60 * 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AbstractSource {
+    Acm,
+    Ieee,
+    Ndss,
+    Neurips,
+    Openreview,
+    Pmlr,
+    Springer,
+    Usenix,
+}
 
 /// Reconstruct plain text from an OpenAlex `abstract_inverted_index`,
 /// or read a plain `abstract` string if present.
@@ -109,7 +121,7 @@ fn collapse_ws(s: &str) -> String {
 
 /// Extract an abstract from a publisher HTML page, trying source-specific
 /// selectors first, then generic `og:description` / `description` meta tags.
-pub fn extract_abstract_html(html: &str, source: Option<AbstractSource>) -> Option<String> {
+fn extract_abstract_html(html: &str, source: Option<AbstractSource>) -> Option<String> {
     let doc = Html::parse_document(html);
 
     let source_hit = match source {
@@ -159,6 +171,19 @@ fn extract_neurips_abstract(doc: &Html) -> Option<String> {
         let text = element_text(section)?;
         if let Some(abstract_text) = text.strip_prefix("Abstract") {
             return non_empty_text(abstract_text);
+        }
+    }
+    let selector = Selector::parse("*").ok()?;
+    let mut after_abstract_heading = false;
+    for element in doc.select(&selector) {
+        match element.value().name() {
+            "h4" => after_abstract_heading = element_text(element).as_deref() == Some("Abstract"),
+            "p" if after_abstract_heading => {
+                if let Some(text) = element_text(element) {
+                    return Some(text);
+                }
+            }
+            _ => {}
         }
     }
     None
@@ -295,27 +320,18 @@ impl Enricher {
         }
     }
 
-    /// Try, in order: API-by-DOI, then static scrape. Returns the first hit.
-    pub async fn enrich(
-        &self,
-        paper: &Paper,
-        source: Option<AbstractSource>,
-    ) -> Result<EnrichResult> {
-        if source == Some(AbstractSource::Openreview) {
-            if let Some(url) = &paper.url {
-                if let Some(abs) = self.openreview_api_abstract(url).await {
-                    return Ok(EnrichResult::Found(abs));
-                }
-                return self.static_scrape(url, source).await;
-            }
-            return Ok(EnrichResult::Missing("OpenReview paper has no URL".into()));
-        }
+    /// Try, in order: API-by-DOI, source API, then static scrape.
+    pub async fn enrich(&self, paper: &Paper) -> Result<EnrichResult> {
         if let Some(doi) = &paper.doi {
             if let Some(abs) = self.api_by_doi(doi).await? {
                 return Ok(EnrichResult::Found(abs));
             }
         }
         if let Some(url) = &paper.url {
+            if let Some(abs) = self.api_by_source_url(url).await? {
+                return Ok(EnrichResult::Found(abs));
+            }
+            let source = paper_source(paper);
             return self.static_scrape(url, source).await;
         }
         Ok(EnrichResult::Missing("paper has no DOI or URL".into()))
@@ -323,18 +339,17 @@ impl Enricher {
 
     pub async fn enrich_many(
         &mut self,
-        inputs: Vec<(Paper, Option<AbstractSource>)>,
+        inputs: Vec<Paper>,
         jobs: usize,
-    ) -> (Vec<(Paper, Result<EnrichResult>)>, Vec<String>) {
-        let mut source_warnings = Vec::new();
-        let mut needed = BTreeSet::new();
-        for (paper, source) in &inputs {
-            if *source != Some(AbstractSource::Openreview) {
-                continue;
-            }
-            let key = (paper.venue.clone(), paper.year);
-            if !self.openreview_cache.contains_key(&key) {
-                needed.insert(key);
+    ) -> Vec<(Paper, Result<EnrichResult>)> {
+        let mut needed = Vec::new();
+        let mut seen = HashSet::new();
+        for paper in &inputs {
+            if paper_source(paper) == Some(AbstractSource::Openreview) {
+                let key = (paper.venue.clone(), paper.year);
+                if !self.openreview_cache.contains_key(&key) && seen.insert(key.clone()) {
+                    needed.push(key);
+                }
             }
         }
 
@@ -344,7 +359,11 @@ impl Enricher {
                     self.openreview_cache.insert(key, abstracts);
                 }
                 Err(reason) => {
-                    source_warnings.push(format!("{} {}: {reason}", key.0, key.1));
+                    tracing::warn!(
+                        "OpenReview batch lookup failed for {} {}: {reason}",
+                        key.0,
+                        key.1
+                    );
                     self.openreview_cache.insert(key, HashMap::new());
                 }
             }
@@ -352,21 +371,16 @@ impl Enricher {
 
         let cache = &self.openreview_cache;
         let enricher = &*self;
-        let results = stream::iter(inputs.into_iter().map(|(paper, source)| {
-            let enricher = enricher;
-            async move {
-                let result = match cached_openreview_abstract(cache, &paper, source) {
-                    Some(abs) => Ok(EnrichResult::Found(abs)),
-                    None => enricher.enrich(&paper, source).await,
-                };
-                (paper, result)
-            }
+        stream::iter(inputs.into_iter().map(|paper| async move {
+            let result = match cached_openreview_abstract(cache, &paper) {
+                Some(abs) => Ok(EnrichResult::Found(abs)),
+                None => enricher.enrich(&paper).await,
+            };
+            (paper, result)
         }))
         .buffer_unordered(jobs.max(1))
         .collect()
-        .await;
-
-        (results, source_warnings)
+        .await
     }
 
     async fn api_by_doi(&self, doi: &str) -> Result<Option<String>> {
@@ -526,6 +540,15 @@ impl Enricher {
             .map(str::to_string)
     }
 
+    async fn api_by_source_url(&self, url: &str) -> Result<Option<String>> {
+        if source_from_paper_url(url) == Some(AbstractSource::Openreview) {
+            if let Some(abs) = self.openreview_api_abstract(url).await {
+                return Ok(Some(abs));
+            }
+        }
+        Ok(None)
+    }
+
     /// Send a request and run `extract` over the JSON body.
     async fn fetch_abstract(
         &self,
@@ -605,6 +628,7 @@ impl Enricher {
                     "static page too large or unreadable".into(),
                 ));
             };
+            let source = source_from_static_url(&url).or(source);
             return Ok(match extract_abstract_html(&html, source) {
                 Some(abs) => EnrichResult::Found(abs),
                 None => EnrichResult::Missing("static page had no extractable abstract".into()),
@@ -615,12 +639,51 @@ impl Enricher {
     }
 }
 
+fn source_from_static_url(url: &Url) -> Option<AbstractSource> {
+    let host = url.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    match host.as_str() {
+        "dl.acm.org" => Some(AbstractSource::Acm),
+        "ieeexplore.ieee.org" => Some(AbstractSource::Ieee),
+        "openreview.net" | "www.openreview.net" => Some(AbstractSource::Openreview),
+        "proceedings.mlr.press" => Some(AbstractSource::Pmlr),
+        "neurips.cc" => Some(AbstractSource::Neurips),
+        "link.springer.com" => Some(AbstractSource::Springer),
+        "ndss-symposium.org" | "www.ndss-symposium.org" => Some(AbstractSource::Ndss),
+        "usenix.org" | "www.usenix.org" => Some(AbstractSource::Usenix),
+        _ if host.ends_with(".neurips.cc") => Some(AbstractSource::Neurips),
+        _ => None,
+    }
+}
+
+fn source_from_paper_url(raw: &str) -> Option<AbstractSource> {
+    let url = parse_static_url(raw)?;
+    source_from_doi_url(&url).or_else(|| source_from_static_url(&url))
+}
+
+fn source_from_doi_url(url: &Url) -> Option<AbstractSource> {
+    let host = url.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    if host != "doi.org" && host != "dx.doi.org" {
+        return None;
+    }
+    let doi = url.path().trim_start_matches('/').to_ascii_lowercase();
+    match doi.as_str() {
+        doi if doi.starts_with("10.1145/") => Some(AbstractSource::Acm),
+        doi if doi.starts_with("10.1109/") => Some(AbstractSource::Ieee),
+        doi if doi.starts_with("10.1007/") => Some(AbstractSource::Springer),
+        doi if doi.starts_with("10.14722/") => Some(AbstractSource::Ndss),
+        _ => None,
+    }
+}
+
+fn paper_source(paper: &Paper) -> Option<AbstractSource> {
+    paper.url.as_deref().and_then(source_from_paper_url)
+}
+
 fn cached_openreview_abstract(
     cache: &HashMap<(String, i32), HashMap<String, String>>,
     paper: &Paper,
-    source: Option<AbstractSource>,
 ) -> Option<String> {
-    if source != Some(AbstractSource::Openreview) {
+    if paper_source(paper) != Some(AbstractSource::Openreview) {
         return None;
     }
     let forum_id = openreview_forum_id(paper.url.as_deref()?)?;

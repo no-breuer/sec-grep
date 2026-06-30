@@ -156,7 +156,6 @@ venues:
     aliases: [dimva]
     rank: B
     tags: [systems, network, malware]
-    abstract_source: springer
 ```
 
 Then ingest and search it:
@@ -166,9 +165,8 @@ sec-grep update --venue DIMVA
 sec-grep 'malware' --venue DIMVA
 ```
 
-`dblp_stream` is the DBLP stream slug from URLs like
-`https://dblp.org/streams/conf/dimva`. `abstract_source` is optional; supported
-values are `acm`, `ieee`, `ndss`, `neurips`, `springer`, and `usenix`.
+`dblp_stream` is the DBLP stream id used by the RDF endpoint, such as
+`conf/dimva`.
 
 ## Abstracts
 

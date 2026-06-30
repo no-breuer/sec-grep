@@ -434,7 +434,6 @@ async fn cmd_update(args: &UpdateArgs, cli: &Cli, paths: &Paths, config: &Config
         log_blank();
         enrich_abstracts(
             &mut db,
-            config,
             &venue_ids,
             &[query::YearRange::new(Some(min_year), None)?],
             args.jobs,
@@ -467,14 +466,13 @@ async fn cmd_enrich(args: &EnrichArgs, cli: &Cli, paths: &Paths, config: &Config
         Some(year) => vec![query::YearRange::new(Some(year), None)?],
         None => Vec::new(),
     };
-    enrich_abstracts(&mut db, config, &venue_ids, &years, args.jobs, args.limit).await
+    enrich_abstracts(&mut db, &venue_ids, &years, args.jobs, args.limit).await
 }
 
 /// Fill missing abstracts, running up to `jobs` fetches concurrently.
 /// `venue_ids` empty means all venues; `limit` caps how many are attempted.
 async fn enrich_abstracts(
     db: &mut Database,
-    config: &Config,
     venue_ids: &[String],
     years: &[query::YearRange],
     jobs: usize,
@@ -529,17 +527,7 @@ async fn enrich_abstracts(
                 batch_venue_summary(&papers)
             ),
         );
-        let inputs = papers
-            .into_iter()
-            .map(|paper| {
-                let source = config.venue(&paper.venue).and_then(|v| v.abstract_source);
-                (paper, source)
-            })
-            .collect::<Vec<_>>();
-        let (results, source_warnings) = enricher.enrich_many(inputs, jobs).await;
-        for warning in source_warnings {
-            log_field("warning", warning);
-        }
+        let results = enricher.enrich_many(papers, jobs).await;
 
         let mut abstract_updates = Vec::new();
         for (paper, res) in results {

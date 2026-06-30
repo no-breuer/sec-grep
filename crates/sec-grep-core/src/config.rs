@@ -27,21 +27,6 @@ pub struct Venue {
     pub rank: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
-    #[serde(default)]
-    pub abstract_source: Option<AbstractSource>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum AbstractSource {
-    Acm,
-    Ieee,
-    Ndss,
-    Neurips,
-    Openreview,
-    Pmlr,
-    Springer,
-    Usenix,
 }
 
 impl Venue {
@@ -453,7 +438,6 @@ mod tests {
             aliases: Vec::new(),
             rank: (!rank.is_empty()).then(|| rank.to_string()),
             tags: tags.iter().map(|tag| tag.to_string()).collect(),
-            abstract_source: None,
         }
     }
 

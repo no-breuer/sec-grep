@@ -7,7 +7,6 @@ venues:
     aliases: [neurips, nips]
     rank: A*
     tags: [ml, evaluation, datasets, benchmarks]
-    abstract_source: neurips
 
   - id: ICML
     name: International Conference on Machine Learning
@@ -15,7 +14,6 @@ venues:
     aliases: [icml]
     rank: A*
     tags: [ml, evaluation, robustness, interpretability]
-    abstract_source: pmlr
 
   - id: ICLR
     name: International Conference on Learning Representations
@@ -23,4 +21,3 @@ venues:
     aliases: [iclr]
     rank: A*
     tags: [representation-learning, ml, evaluation, interpretability]
-    abstract_source: openreview
