@@ -120,6 +120,12 @@ sec-grep 'malware OR botnet' --rank A --tag systems
 Bundles select venue sets for subfields such as security, ML, and software
 engineering. Tags filter papers within the indexed corpus.
 
+```sh
+sec-grep update --bundle security,ml
+sec-grep enrich --bundle ml
+sec-grep 'mechanistic interpretability' --tag ml --year 2023-
+```
+
 ## Venues
 
 Bundled venue catalogs live in `crates/sec-grep-core/venues/`.

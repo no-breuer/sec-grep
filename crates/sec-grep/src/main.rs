@@ -1,6 +1,10 @@
 mod tui;
 
-use std::{collections::BTreeMap, io::Write, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -11,6 +15,7 @@ use sec_grep_core::db::{Database, Search, Sort};
 use sec_grep_core::dblp::Dblp;
 use sec_grep_core::output::{self, Column, Format};
 use sec_grep_core::query;
+use sec_grep_core::Paper;
 
 /// Upper bound for dblp year filters; papers never exceed this.
 const MAX_YEAR: i32 = 2100;
@@ -112,6 +117,9 @@ struct UpdateArgs {
     /// Only ingest from these venues (id or alias).
     #[arg(long, value_delimiter = ',')]
     venue: Vec<String>,
+    /// Use these bundled venue sets for this update (overrides config bundles).
+    #[arg(long, value_delimiter = ',')]
+    bundle: Vec<String>,
     /// Minimum year (overrides config default).
     #[arg(long)]
     since: Option<i32>,
@@ -128,6 +136,12 @@ struct EnrichArgs {
     /// Only enrich these venues (id or alias); default is all.
     #[arg(long, value_delimiter = ',')]
     venue: Vec<String>,
+    /// Use these bundled venue sets for this enrich run (overrides config bundles).
+    #[arg(long, value_delimiter = ',')]
+    bundle: Vec<String>,
+    /// Only enrich papers from this year onward.
+    #[arg(long)]
+    since: Option<i32>,
     /// Concurrent abstract fetches.
     #[arg(long, default_value_t = DEFAULT_JOBS)]
     jobs: usize,
@@ -217,8 +231,16 @@ fn flush_stderr() {
 }
 
 fn load_config(cli: &Cli, paths: &Paths) -> Result<Config> {
+    load_config_with_bundles(cli, paths, None)
+}
+
+fn load_config_with_bundles(
+    cli: &Cli,
+    paths: &Paths,
+    bundle_override: Option<&[String]>,
+) -> Result<Config> {
     let user_path = config_path(cli, paths);
-    Config::load(Some(&user_path)).context("loading venue config")
+    Config::load_with_bundles(Some(&user_path), bundle_override).context("loading venue config")
 }
 
 fn config_path(cli: &Cli, paths: &Paths) -> PathBuf {
@@ -248,11 +270,24 @@ fn cmd_init(cli: &Cli, paths: &Paths) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     Database::open(&path).context("creating database")?;
+    let config_path = config_path(cli, paths);
+    write_default_config(&config_path)?;
     log_header("sec-grep initialized");
     log_field("database", path.display());
-    log_field("config", config_path(cli, paths).display());
+    log_field("config", config_path.display());
     log_blank();
     log_field("next", "`sec-grep update`");
+    Ok(())
+}
+
+fn write_default_config(path: &Path) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, Config::default_user_config_yaml()?)?;
     Ok(())
 }
 
@@ -345,6 +380,13 @@ async fn cmd_update(args: &UpdateArgs, cli: &Cli, paths: &Paths, config: &Config
     paths.ensure_dirs()?;
     let path = db_path(cli, paths);
     let mut db = Database::open(&path).context("opening database")?;
+    let override_config;
+    let config = if args.bundle.is_empty() {
+        config
+    } else {
+        override_config = load_config_with_bundles(cli, paths, Some(&args.bundle))?;
+        &override_config
+    };
 
     let venue_ids = if args.venue.is_empty() {
         config.all_venue_ids()
@@ -354,6 +396,7 @@ async fn cmd_update(args: &UpdateArgs, cli: &Cli, paths: &Paths, config: &Config
     let min_year = args.since.unwrap_or(config.defaults.min_year);
 
     log_header("sec-grep update");
+    log_field("bundles", config.bundles.join(", "));
     log_field("venues", venue_ids.len());
     log_field("since", min_year);
     log_blank();
@@ -389,19 +432,42 @@ async fn cmd_update(args: &UpdateArgs, cli: &Cli, paths: &Paths, config: &Config
 
     if args.abstracts {
         log_blank();
-        enrich_abstracts(&mut db, config, &venue_ids, args.jobs, None).await?;
+        enrich_abstracts(
+            &mut db,
+            config,
+            &venue_ids,
+            &[query::YearRange::new(Some(min_year), None)?],
+            args.jobs,
+            None,
+        )
+        .await?;
     }
     Ok(())
 }
 
 async fn cmd_enrich(args: &EnrichArgs, cli: &Cli, paths: &Paths, config: &Config) -> Result<()> {
     let mut db = open_db(cli, paths)?;
+    let override_config;
+    let config = if args.bundle.is_empty() {
+        config
+    } else {
+        override_config = load_config_with_bundles(cli, paths, Some(&args.bundle))?;
+        &override_config
+    };
     let venue_ids = if args.venue.is_empty() {
-        Vec::new()
+        if args.bundle.is_empty() {
+            Vec::new()
+        } else {
+            config.all_venue_ids()
+        }
     } else {
         config.resolve_venues(&args.venue)?
     };
-    enrich_abstracts(&mut db, config, &venue_ids, args.jobs, args.limit).await
+    let years = match args.since {
+        Some(year) => vec![query::YearRange::new(Some(year), None)?],
+        None => Vec::new(),
+    };
+    enrich_abstracts(&mut db, config, &venue_ids, &years, args.jobs, args.limit).await
 }
 
 /// Fill missing abstracts, running up to `jobs` fetches concurrently.
@@ -410,16 +476,20 @@ async fn enrich_abstracts(
     db: &mut Database,
     config: &Config,
     venue_ids: &[String],
+    years: &[query::YearRange],
     jobs: usize,
     limit: Option<usize>,
 ) -> Result<()> {
     let mut enricher = Enricher::new(Secrets::load());
-    let pending = db.count_missing_abstracts(venue_ids)?;
+    let pending = db.count_missing_abstracts(venue_ids, years)?;
     let total = limit.map_or(pending, |limit| limit.min(pending));
     let jobs = jobs.max(1);
     let batch_size = enrich_batch_size(jobs);
     log_header("abstract enrichment");
     log_field("pending", format_args!("{pending} abstracts"));
+    if !years.is_empty() {
+        log_field("years", format_args!("{}", format_year_ranges(years)));
+    }
     if total != pending {
         log_field("selected", format_args!("{total} abstracts"));
     }
@@ -432,22 +502,40 @@ async fn enrich_abstracts(
     let mut after_id = 0;
     while processed < total {
         let remaining = total - processed;
-        let batch =
-            db.papers_missing_abstract_batch(venue_ids, after_id, remaining.min(batch_size))?;
+        let batch = db.papers_missing_abstract_batch(
+            venue_ids,
+            years,
+            after_id,
+            remaining.min(batch_size),
+        )?;
         let Some(next_after_id) = batch.last().map(|paper| paper.id) else {
             break;
         };
         after_id = next_after_id;
 
-        let inputs = batch
+        let papers = batch
             .into_iter()
-            .map(|missing| {
-                let paper = missing.paper;
+            .map(|missing| missing.paper)
+            .collect::<Vec<_>>();
+
+        let batch_len = papers.len();
+        log_field(
+            "batch",
+            format_args!(
+                "{}-{} / {} ({})",
+                processed + 1,
+                processed + batch_len,
+                total,
+                batch_venue_summary(&papers)
+            ),
+        );
+        let inputs = papers
+            .into_iter()
+            .map(|paper| {
                 let source = config.venue(&paper.venue).and_then(|v| v.abstract_source);
                 (paper, source)
             })
             .collect::<Vec<_>>();
-
         let (results, source_warnings) = enricher.enrich_many(inputs, jobs).await;
         for warning in source_warnings {
             log_field("warning", warning);
@@ -467,13 +555,21 @@ async fn enrich_abstracts(
                 }
                 Err(e) => tracing::warn!("abstract fetch failed for {dblp_key}: {e}"),
             }
-            if processed % ENRICH_PROGRESS_INTERVAL == 0 {
+            if processed.is_multiple_of(ENRICH_PROGRESS_INTERVAL) {
                 log_field(
                     "progress",
                     format_args!("{processed}/{total} processed, {filled} filled"),
                 );
             }
         }
+        log_field(
+            "batch done",
+            format_args!(
+                "{} filled, {} missed",
+                abstract_updates.len(),
+                batch_len - abstract_updates.len()
+            ),
+        );
         db.set_abstracts(&abstract_updates)?;
     }
     log_blank();
@@ -488,14 +584,48 @@ async fn enrich_abstracts(
     Ok(())
 }
 
+fn format_year_ranges(years: &[query::YearRange]) -> String {
+    years
+        .iter()
+        .map(|year| match year.bounds() {
+            (Some(min), Some(max)) if min == max => min.to_string(),
+            (Some(min), Some(max)) => format!("{min}-{max}"),
+            (Some(min), None) => format!("{min}-"),
+            (None, Some(max)) => format!("-{max}"),
+            (None, None) => String::new(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn enrich_batch_size(jobs: usize) -> usize {
     jobs.saturating_mul(4)
         .clamp(MIN_ENRICH_BATCH, MAX_ENRICH_BATCH)
 }
 
+fn batch_venue_summary(inputs: &[Paper]) -> String {
+    let mut counts = BTreeMap::new();
+    for paper in inputs {
+        *counts.entry(paper.venue.as_str()).or_insert(0usize) += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(venue, count)| format!("{venue}:{count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_test_path(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("sec-grep-{name}-{}-{nanos}", std::process::id()))
+    }
 
     #[test]
     fn build_search_preserves_empty_cli_venue_filter() {
@@ -606,6 +736,63 @@ mod tests {
                 query::YearRange::single(2029)
             ]
         );
+    }
+
+    #[test]
+    fn update_bundle_flags_are_accepted() {
+        let cli = Cli::try_parse_from(["sec-grep", "update", "--bundle", "se,ml"]).unwrap();
+        let Some(Command::Update(args)) = cli.command else {
+            panic!("expected update command");
+        };
+        assert_eq!(args.bundle, vec!["se".to_string(), "ml".to_string()]);
+    }
+
+    #[test]
+    fn enrich_bundle_flags_are_accepted() {
+        let cli = Cli::try_parse_from(["sec-grep", "enrich", "--bundle", "se,ml"]).unwrap();
+        let Some(Command::Enrich(args)) = cli.command else {
+            panic!("expected enrich command");
+        };
+        assert_eq!(args.bundle, vec!["se".to_string(), "ml".to_string()]);
+    }
+
+    #[test]
+    fn bundle_override_limits_venue_resolution() {
+        let cli = Cli::try_parse_from(["sec-grep", "update", "--bundle", "se", "--venue", "ndss"])
+            .unwrap();
+        let paths = Paths {
+            data_dir: temp_test_path("data"),
+            config_dir: temp_test_path("config"),
+        };
+        let Some(Command::Update(args)) = &cli.command else {
+            panic!("expected update command");
+        };
+        let config = load_config_with_bundles(&cli, &paths, Some(&args.bundle)).unwrap();
+        assert!(config.resolve_venues(&args.venue).is_err());
+    }
+
+    #[test]
+    fn enrich_since_flag_is_accepted() {
+        let cli = Cli::try_parse_from(["sec-grep", "enrich", "--since", "2025"]).unwrap();
+        let Some(Command::Enrich(args)) = cli.command else {
+            panic!("expected enrich command");
+        };
+        assert_eq!(args.since, Some(2025));
+    }
+
+    #[test]
+    fn write_default_config_creates_but_does_not_overwrite() {
+        let path = temp_test_path("config.yaml");
+        let _ = std::fs::remove_file(&path);
+        write_default_config(&path).unwrap();
+        let default = std::fs::read_to_string(&path).unwrap();
+        assert!(default.contains("security"));
+        assert!(default.contains("min_year: 2000"));
+
+        std::fs::write(&path, "bundles: []\n").unwrap();
+        write_default_config(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "bundles: []\n");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

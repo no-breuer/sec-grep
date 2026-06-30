@@ -183,10 +183,11 @@ impl Database {
     pub fn papers_missing_abstract_batch(
         &self,
         venues: &[String],
+        years: &[YearRange],
         after_id: i64,
         limit: usize,
     ) -> Result<Vec<MissingPaper>> {
-        let mut parts = missing_abstract_parts(venues, Some(after_id));
+        let mut parts = missing_abstract_parts(venues, years, Some(after_id));
         let next = parts.args.len() + 1;
         let sql = format!(
             "SELECT p.id, {PAPER_COLUMNS_WITH_ALIAS} FROM papers p {} \
@@ -201,8 +202,8 @@ impl Database {
         Ok(rows)
     }
 
-    pub fn count_missing_abstracts(&self, venues: &[String]) -> Result<usize> {
-        let parts = missing_abstract_parts(venues, None);
+    pub fn count_missing_abstracts(&self, venues: &[String], years: &[YearRange]) -> Result<usize> {
+        let parts = missing_abstract_parts(venues, years, None);
         let sql = format!("SELECT COUNT(*) FROM papers p {}", parts.where_sql);
         let count: i64 = self
             .conn
@@ -432,7 +433,11 @@ fn escape_like(value: &str) -> String {
     escaped
 }
 
-fn missing_abstract_parts(venues: &[String], after_id: Option<i64>) -> SearchQueryParts {
+fn missing_abstract_parts(
+    venues: &[String],
+    years: &[YearRange],
+    after_id: Option<i64>,
+) -> SearchQueryParts {
     let mut args: Vec<Value> = Vec::new();
     let mut where_clauses = vec![
         "p.url IS NOT NULL".to_string(),
@@ -441,6 +446,10 @@ fn missing_abstract_parts(venues: &[String], after_id: Option<i64>) -> SearchQue
     if !venues.is_empty() {
         where_clauses.push(in_clause("p.venue", args.len() + 1, venues.len()));
         append_string_args(&mut args, venues);
+    }
+    if !years.is_empty() {
+        where_clauses.push(year_ranges_clause("p.year", args.len() + 1, years));
+        append_year_range_args(&mut args, years);
     }
     if let Some(after_id) = after_id {
         let next = args.len() + 1;
@@ -688,14 +697,31 @@ mod tests {
     #[test]
     fn missing_abstract_batch_uses_keyset_bound() {
         let db = seeded();
-        assert_eq!(db.count_missing_abstracts(&[]).unwrap(), 1);
-        let missing = db.papers_missing_abstract_batch(&[], 0, 10).unwrap();
+        assert_eq!(db.count_missing_abstracts(&[], &[]).unwrap(), 1);
+        let missing = db.papers_missing_abstract_batch(&[], &[], 0, 10).unwrap();
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].paper.dblp_key, "k2");
         let next = db
-            .papers_missing_abstract_batch(&[], missing[0].id, 10)
+            .papers_missing_abstract_batch(&[], &[], missing[0].id, 10)
             .unwrap();
         assert!(next.is_empty());
+    }
+
+    #[test]
+    fn missing_abstract_batch_filters_years() {
+        let db = seeded();
+        assert_eq!(
+            db.count_missing_abstracts(&[], &[YearRange::single(2020)])
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.papers_missing_abstract_batch(&[], &[YearRange::single(2021)], 0, 10)
+                .unwrap()[0]
+                .paper
+                .dblp_key,
+            "k2"
+        );
     }
 
     #[test]
