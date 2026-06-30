@@ -186,12 +186,15 @@ No API keys are required, but keys can improve rate limits and coverage.
 |---|---|---|
 | `OPENALEX_API_KEY` | OpenAlex DOI lookup | [openalex.org/settings/api](https://openalex.org/settings/api) |
 | `SEMANTIC_SCHOLAR_S2_KEY` | Semantic Scholar DOI lookup | [semanticscholar.org/product/api](https://www.semanticscholar.org/product/api) |
+| `OPENREVIEW_USERNAME` / `OPENREVIEW_PASSWORD` | OpenReview lookups | [OpenReview API docs](https://docs.openreview.net/getting-started/using-the-api/installing-and-instantiating-the-python-client) |
 
 Set them in the shell:
 
 ```sh
 export OPENALEX_API_KEY=...
 export SEMANTIC_SCHOLAR_S2_KEY=...
+export OPENREVIEW_USERNAME=...
+export OPENREVIEW_PASSWORD=...
 ```
 
 Or place them in a local `.env` file:
@@ -199,6 +202,8 @@ Or place them in a local `.env` file:
 ```sh
 OPENALEX_API_KEY=
 SEMANTIC_SCHOLAR_S2_KEY=
+OPENREVIEW_USERNAME=
+OPENREVIEW_PASSWORD=
 ```
 
 `.env` is loaded automatically when present.

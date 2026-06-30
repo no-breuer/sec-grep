@@ -388,6 +388,8 @@ fn rank_sort_key(rank: &str) -> u8 {
 pub struct Secrets {
     pub openalex_api_key: Option<String>,
     pub semantic_scholar_key: Option<String>,
+    pub openreview_username: Option<String>,
+    pub openreview_password: Option<String>,
 }
 
 impl Secrets {
@@ -397,6 +399,8 @@ impl Secrets {
         Self {
             openalex_api_key: non_empty_env("OPENALEX_API_KEY"),
             semantic_scholar_key: non_empty_env("SEMANTIC_SCHOLAR_S2_KEY"),
+            openreview_username: non_empty_env("OPENREVIEW_USERNAME"),
+            openreview_password: non_empty_env("OPENREVIEW_PASSWORD"),
         }
     }
 }

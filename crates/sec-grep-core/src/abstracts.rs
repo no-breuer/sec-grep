@@ -10,6 +10,7 @@
 use std::{
     collections::{BTreeSet, HashMap},
     net::IpAddr,
+    sync::OnceLock,
     time::Duration,
 };
 
@@ -26,6 +27,7 @@ const MAX_HTML_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_STATIC_REDIRECTS: usize = 5;
 const MAX_RATE_LIMIT_SLEEP: Duration = Duration::from_secs(65);
 const OPENREVIEW_PAGE_SIZE: usize = 500;
+const OPENREVIEW_LOGIN_EXPIRES_IN: u64 = 7 * 24 * 60 * 60;
 
 /// Reconstruct plain text from an OpenAlex `abstract_inverted_index`,
 /// or read a plain `abstract` string if present.
@@ -268,6 +270,7 @@ pub struct Enricher {
     client: reqwest::Client,
     secrets: Secrets,
     openreview_cache: HashMap<(String, i32), HashMap<String, String>>,
+    openreview_login_token: OnceLock<String>,
 }
 
 pub enum EnrichResult {
@@ -288,6 +291,7 @@ impl Enricher {
             client,
             secrets,
             openreview_cache: HashMap::new(),
+            openreview_login_token: OnceLock::new(),
         }
     }
 
@@ -442,7 +446,7 @@ impl Enricher {
         let mut out = HashMap::new();
         let mut offset = 0usize;
         loop {
-            let req = self.client.get(base).query(&[
+            let req = self.openreview_get(base).await.query(&[
                 ("content.venueid", venue_id),
                 ("limit", &OPENREVIEW_PAGE_SIZE.to_string()),
                 ("offset", &offset.to_string()),
@@ -463,14 +467,63 @@ impl Enricher {
 
     async fn openreview_api_abstract(&self, url: &str) -> Option<String> {
         let forum_id = openreview_forum_id(url)?;
+        for base in [
+            "https://api2.openreview.net/notes",
+            "https://api.openreview.net/notes",
+        ] {
+            let req = self
+                .openreview_get(base)
+                .await
+                .query(&[("id", forum_id.as_str())]);
+            let Ok(json) = self.fetch_json(req).await else {
+                continue;
+            };
+            if let Some(abs) = abstracts_from_openreview_notes(&json)
+                .get(&forum_id)
+                .cloned()
+            {
+                return Some(abs);
+            }
+        }
+        None
+    }
+
+    async fn openreview_get(&self, url: &str) -> reqwest::RequestBuilder {
+        let req = self.client.get(url);
+        if url.contains("api2.openreview.net") {
+            if let Some(token) = self.openreview_login_token().await {
+                return req.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+        }
+        req
+    }
+
+    async fn openreview_login_token(&self) -> Option<String> {
+        if let Some(token) = self.openreview_login_token.get() {
+            return Some(token.clone());
+        }
+        let token = self.openreview_login().await;
+        if let Some(token) = &token {
+            let _ = self.openreview_login_token.set(token.clone());
+        }
+        token
+    }
+
+    async fn openreview_login(&self) -> Option<String> {
+        let username = self.secrets.openreview_username.as_deref()?;
+        let password = self.secrets.openreview_password.as_deref()?;
         let req = self
             .client
-            .get("https://api.openreview.net/notes")
-            .query(&[("id", forum_id.as_str())]);
+            .post("https://api2.openreview.net/login")
+            .json(&serde_json::json!({
+                "id": username,
+                "password": password,
+                "expiresIn": OPENREVIEW_LOGIN_EXPIRES_IN,
+            }));
         let json = self.fetch_json(req).await.ok()?;
-        abstracts_from_openreview_notes(&json)
-            .get(&forum_id)
-            .cloned()
+        json.get("token")
+            .and_then(|token| token.as_str())
+            .map(str::to_string)
     }
 
     /// Send a request and run `extract` over the JSON body.
