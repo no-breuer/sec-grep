@@ -1,8 +1,8 @@
 //! Optional abstract enrichment.
 //!
 //! Two tiers, each a fallback for the previous:
-//!   1. API by DOI: OpenAlex -> Semantic Scholar -> Crossref
-//!   2. Static HTML scrape (publisher page)
+//!   1. APIs: DOI, source URL, then guarded metadata lookup
+//!   2. Static URL extraction (publisher page)
 //!
 //! The pure parsing/extraction helpers are unit-tested; the networked
 //! orchestration is exercised end-to-end via the CLI.
@@ -28,6 +28,7 @@ const MAX_STATIC_REDIRECTS: usize = 5;
 const MAX_RATE_LIMIT_SLEEP: Duration = Duration::from_secs(65);
 const OPENREVIEW_PAGE_SIZE: usize = 500;
 const OPENREVIEW_LOGIN_EXPIRES_IN: u64 = 7 * 24 * 60 * 60;
+const DOI_BATCH_SIZE: usize = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum AbstractSource {
@@ -43,7 +44,7 @@ enum AbstractSource {
 
 /// Reconstruct plain text from an OpenAlex `abstract_inverted_index`,
 /// or read a plain `abstract` string if present.
-pub fn abstract_from_openalex(work: &Value) -> Option<String> {
+fn abstract_from_openalex(work: &Value) -> Option<String> {
     if let Some(s) = work.get("abstract").and_then(|v| v.as_str()) {
         if !s.trim().is_empty() {
             return Some(s.trim().to_string());
@@ -71,13 +72,159 @@ pub fn abstract_from_openalex(work: &Value) -> Option<String> {
     )
 }
 
-pub fn abstract_from_semantic_scholar(paper: &Value) -> Option<String> {
+fn abstract_from_semantic_scholar(paper: &Value) -> Option<String> {
     paper
         .get("abstract")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
+}
+
+fn abstract_from_openalex_title_search(results: &Value, paper: &Paper) -> Option<String> {
+    results
+        .get("results")?
+        .as_array()?
+        .iter()
+        .find(|work| openalex_identity_matches(work, paper))
+        .and_then(abstract_from_openalex)
+}
+
+fn abstract_from_semantic_scholar_title_search(results: &Value, paper: &Paper) -> Option<String> {
+    results
+        .get("data")?
+        .as_array()?
+        .iter()
+        .find(|work| semantic_scholar_identity_matches(work, paper))
+        .and_then(abstract_from_semantic_scholar)
+}
+
+fn abstracts_from_openalex_works(results: &Value, dois: &[String]) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Some(results) = results.get("results").and_then(|v| v.as_array()) else {
+        return out;
+    };
+    for work in results {
+        let Some(doi) = work
+            .get("doi")
+            .and_then(|v| v.as_str())
+            .and_then(normalized_doi)
+            .filter(|doi| dois.iter().any(|wanted| wanted == doi))
+        else {
+            continue;
+        };
+        if let Some(abs) = abstract_from_openalex(work) {
+            out.insert(doi, abs);
+        }
+    }
+    out
+}
+
+fn abstracts_from_semantic_scholar_batch(
+    results: &Value,
+    dois: &[String],
+) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Some(results) = results.as_array() else {
+        return out;
+    };
+    for paper in results {
+        let Some(doi) = paper
+            .get("externalIds")
+            .and_then(|ids| ids.get("DOI"))
+            .and_then(|v| v.as_str())
+            .and_then(normalized_doi)
+            .filter(|doi| dois.iter().any(|wanted| wanted == doi))
+        else {
+            continue;
+        };
+        if let Some(abs) = abstract_from_semantic_scholar(paper) {
+            out.insert(doi, abs);
+        }
+    }
+    out
+}
+
+fn openalex_identity_matches(work: &Value, paper: &Paper) -> bool {
+    let title = work
+        .get("title")
+        .or_else(|| work.get("display_name"))
+        .and_then(|v| v.as_str());
+    let year = work.get("publication_year").and_then(|v| v.as_i64());
+    let author = work
+        .get("authorships")
+        .and_then(|v| v.as_array())
+        .and_then(|authors| authors.first())
+        .and_then(|authorship| authorship.get("author"))
+        .and_then(|author| author.get("display_name"))
+        .and_then(|v| v.as_str());
+    paper_identity_matches(title, year, author, paper)
+}
+
+fn semantic_scholar_identity_matches(work: &Value, paper: &Paper) -> bool {
+    let title = work.get("title").and_then(|v| v.as_str());
+    let year = work.get("year").and_then(|v| v.as_i64());
+    let author = work
+        .get("authors")
+        .and_then(|v| v.as_array())
+        .and_then(|authors| authors.first())
+        .and_then(|author| author.get("name"))
+        .and_then(|v| v.as_str());
+    paper_identity_matches(title, year, author, paper)
+}
+
+fn paper_identity_matches(
+    title: Option<&str>,
+    year: Option<i64>,
+    first_author: Option<&str>,
+    paper: &Paper,
+) -> bool {
+    let Some(title) = title else {
+        return false;
+    };
+    let Some(year) = year else {
+        return false;
+    };
+    let Some(first_author) = first_author else {
+        return false;
+    };
+    let Some(paper_first_author) = paper
+        .authors
+        .split(',')
+        .next()
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return false;
+    };
+    normalized_match_text(title) == normalized_match_text(&paper.title)
+        && (year - i64::from(paper.year)).abs() <= 1
+        && normalized_match_text(first_author) == normalized_match_text(paper_first_author)
+}
+
+fn normalized_match_text(text: &str) -> String {
+    text.trim()
+        .trim_end_matches('.')
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn normalized_doi(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches('.');
+    let lower = trimmed.to_ascii_lowercase();
+    for prefix in [
+        "https://doi.org/",
+        "http://doi.org/",
+        "https://dx.doi.org/",
+        "http://dx.doi.org/",
+        "doi:",
+    ] {
+        if lower.starts_with(prefix) {
+            return non_empty_text(&trimmed[prefix.len()..]).map(|doi| doi.to_ascii_lowercase());
+        }
+    }
+    non_empty_text(trimmed).map(|doi| doi.to_ascii_lowercase())
 }
 
 fn abstracts_from_openreview_notes(notes: &Value) -> HashMap<String, String> {
@@ -109,7 +256,7 @@ fn openreview_content_value(value: &Value) -> Option<String> {
 }
 
 /// Crossref returns JATS-flavored XML in `message.abstract`; strip tags.
-pub fn abstract_from_crossref(message: &Value) -> Option<String> {
+fn abstract_from_crossref(message: &Value) -> Option<String> {
     let raw = message.get("abstract").and_then(|v| v.as_str())?;
     let doc = Html::parse_fragment(raw);
     element_text(doc.root_element())
@@ -295,6 +442,7 @@ pub struct Enricher {
     client: reqwest::Client,
     secrets: Secrets,
     openreview_cache: HashMap<(String, i32), HashMap<String, String>>,
+    doi_cache: HashMap<String, Option<String>>,
     openreview_login_token: OnceLock<String>,
 }
 
@@ -316,11 +464,12 @@ impl Enricher {
             client,
             secrets,
             openreview_cache: HashMap::new(),
+            doi_cache: HashMap::new(),
             openreview_login_token: OnceLock::new(),
         }
     }
 
-    /// Try, in order: API-by-DOI, source API, then static scrape.
+    /// Try APIs first, then static publisher pages.
     pub async fn enrich(&self, paper: &Paper) -> Result<EnrichResult> {
         if let Some(doi) = &paper.doi {
             if let Some(abs) = self.api_by_doi(doi).await? {
@@ -331,10 +480,8 @@ impl Enricher {
             if let Some(abs) = self.api_by_source_url(url).await? {
                 return Ok(EnrichResult::Found(abs));
             }
-            let source = paper_source(paper);
-            return self.static_scrape(url, source).await;
         }
-        Ok(EnrichResult::Missing("paper has no DOI or URL".into()))
+        self.fallback_enrich(paper).await
     }
 
     pub async fn enrich_many(
@@ -342,39 +489,21 @@ impl Enricher {
         inputs: Vec<Paper>,
         jobs: usize,
     ) -> Vec<(Paper, Result<EnrichResult>)> {
-        let mut needed = Vec::new();
-        let mut seen = HashSet::new();
-        for paper in &inputs {
-            if paper_source(paper) == Some(AbstractSource::Openreview) {
-                let key = (paper.venue.clone(), paper.year);
-                if !self.openreview_cache.contains_key(&key) && seen.insert(key.clone()) {
-                    needed.push(key);
-                }
-            }
-        }
-
-        for key in needed {
-            match self.openreview_accepted_abstracts(&key.0, key.1).await {
-                Ok(abstracts) => {
-                    self.openreview_cache.insert(key, abstracts);
-                }
-                Err(reason) => {
-                    tracing::warn!(
-                        "OpenReview batch lookup failed for {} {}: {reason}",
-                        key.0,
-                        key.1
-                    );
-                    self.openreview_cache.insert(key, HashMap::new());
-                }
-            }
-        }
-
-        let cache = &self.openreview_cache;
+        self.prefetch_api_batches(&inputs).await;
+        let openreview_cache = &self.openreview_cache;
+        let doi_cache = &self.doi_cache;
         let enricher = &*self;
         stream::iter(inputs.into_iter().map(|paper| async move {
-            let result = match cached_openreview_abstract(cache, &paper) {
+            let doi_batch_tried = paper
+                .doi
+                .as_deref()
+                .and_then(normalized_doi)
+                .is_some_and(|doi| doi_cache.contains_key(&doi));
+            let result = match cached_doi_abstract(doi_cache, &paper)
+                .or_else(|| cached_openreview_abstract(openreview_cache, &paper))
+            {
                 Some(abs) => Ok(EnrichResult::Found(abs)),
-                None => enricher.enrich(&paper).await,
+                None => enricher.enrich_after_batch(&paper, doi_batch_tried).await,
             };
             (paper, result)
         }))
@@ -383,18 +512,137 @@ impl Enricher {
         .await
     }
 
-    async fn api_by_doi(&self, doi: &str) -> Result<Option<String>> {
-        let openalex_req = {
-            let req = self
-                .client
-                .get(format!("https://api.openalex.org/works/doi:{doi}"));
-            match &self.secrets.openalex_api_key {
-                Some(key) => req.query(&[("api_key", key.as_str())]),
-                None => req,
+    async fn prefetch_api_batches(&mut self, inputs: &[Paper]) {
+        self.prefetch_doi_batches(inputs).await;
+        let mut needed = Vec::new();
+        let mut seen = HashSet::new();
+        for paper in inputs {
+            if paper_source(paper) == Some(AbstractSource::Openreview) {
+                let key = (paper.venue.clone(), paper.year);
+                if !self.openreview_cache.contains_key(&key) && seen.insert(key.clone()) {
+                    needed.push(key);
+                }
             }
-        };
+        }
+        for key in needed {
+            match self.openreview_accepted_abstracts(&key.0, key.1).await {
+                Ok(abstracts) => {
+                    self.openreview_cache.insert(key, abstracts);
+                }
+                Err(e) => tracing::warn!(
+                    "OpenReview batch lookup failed for {} {}: {e}",
+                    key.0,
+                    key.1
+                ),
+            }
+        }
+    }
+
+    async fn prefetch_doi_batches(&mut self, inputs: &[Paper]) {
+        let mut needed = Vec::new();
+        let mut seen = HashSet::new();
+        for paper in inputs {
+            let Some(doi) = paper.doi.as_deref().and_then(normalized_doi) else {
+                continue;
+            };
+            if !self.doi_cache.contains_key(&doi) && seen.insert(doi.clone()) {
+                needed.push(doi);
+            }
+        }
+
+        for chunk in needed.chunks(DOI_BATCH_SIZE) {
+            let mut batch_failed = false;
+            let mut hits = match self.semantic_scholar_doi_abstracts(chunk).await {
+                Ok(hits) => hits,
+                Err(e) => {
+                    batch_failed = true;
+                    tracing::warn!("Semantic Scholar DOI batch lookup failed: {e}");
+                    HashMap::new()
+                }
+            };
+            let missing = chunk
+                .iter()
+                .filter(|doi| !hits.contains_key(*doi))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                match self.openalex_doi_abstracts(&missing).await {
+                    Ok(openalex_hits) => hits.extend(openalex_hits),
+                    Err(e) => {
+                        batch_failed = true;
+                        tracing::warn!("OpenAlex DOI batch lookup failed: {e}");
+                    }
+                }
+            }
+            for doi in chunk {
+                match hits.remove(doi) {
+                    Some(abs) => {
+                        self.doi_cache.insert(doi.clone(), Some(abs));
+                    }
+                    None if !batch_failed => {
+                        self.doi_cache.insert(doi.clone(), None);
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    async fn enrich_after_batch(
+        &self,
+        paper: &Paper,
+        doi_batch_tried: bool,
+    ) -> Result<EnrichResult> {
+        if !doi_batch_tried {
+            if let Some(doi) = &paper.doi {
+                if let Some(abs) = self.api_by_doi(doi).await? {
+                    return Ok(EnrichResult::Found(abs));
+                }
+            }
+        }
+        if let Some(url) = &paper.url {
+            if let Some(abs) = self.api_by_source_url(url).await? {
+                return Ok(EnrichResult::Found(abs));
+            }
+        }
+        self.fallback_enrich(paper).await
+    }
+
+    async fn fallback_enrich(&self, paper: &Paper) -> Result<EnrichResult> {
+        let source = paper_source(paper);
+        let mut static_miss = None;
+        if source.is_some_and(|source| source != AbstractSource::Openreview) {
+            if let Some(url) = &paper.url {
+                match self.static_scrape(url, source).await? {
+                    EnrichResult::Found(abs) => return Ok(EnrichResult::Found(abs)),
+                    EnrichResult::Missing(reason) => {
+                        static_miss = Some(reason);
+                    }
+                }
+            }
+        }
+
+        if let Some(abs) = self.api_by_title(paper).await? {
+            return Ok(EnrichResult::Found(abs));
+        }
+        if let Some(reason) = static_miss {
+            return Ok(EnrichResult::Missing(reason));
+        }
+        if let Some(url) = &paper.url {
+            return self.static_scrape(url, source).await;
+        }
+        Ok(EnrichResult::Missing(
+            "API metadata lookup missed and paper has no URL".into(),
+        ))
+    }
+
+    async fn api_by_doi(&self, doi: &str) -> Result<Option<String>> {
         if let EnrichResult::Found(abs) = self
-            .fetch_abstract(openalex_req, abstract_from_openalex)
+            .fetch_openalex_abstract(
+                &format!("https://api.openalex.org/works/doi:{doi}"),
+                &[],
+                abstract_from_openalex,
+            )
             .await
         {
             return Ok(Some(abs));
@@ -410,7 +658,7 @@ impl Enricher {
             }
         };
         if let EnrichResult::Found(abs) = self
-            .fetch_abstract(s2_req, abstract_from_semantic_scholar)
+            .fetch_abstract_no_retry(s2_req, abstract_from_semantic_scholar)
             .await
         {
             return Ok(Some(abs));
@@ -432,51 +680,80 @@ impl Enricher {
         )
     }
 
-    async fn openreview_accepted_abstracts(
-        &self,
-        venue: &str,
-        year: i32,
-    ) -> std::result::Result<HashMap<String, String>, String> {
-        let venue_id = format!("{venue}.cc/{year}/Conference");
-        for base in [
-            "https://api2.openreview.net/notes",
-            "https://api.openreview.net/notes",
-        ] {
-            let abstracts = self
-                .openreview_accepted_abstracts_from(base, &venue_id)
-                .await?;
-            if !abstracts.is_empty() {
-                return Ok(abstracts);
-            }
-        }
-        Ok(HashMap::new())
+    async fn openalex_doi_abstracts(&self, dois: &[String]) -> Result<HashMap<String, String>> {
+        let filter = format!("doi:{}", dois.join("|"));
+        let per_page = dois.len().to_string();
+        let json = self
+            .fetch_openalex_json(
+                "https://api.openalex.org/works",
+                &[("filter", filter.as_str()), ("per-page", per_page.as_str())],
+            )
+            .await
+            .map_err(crate::Error::Other)?;
+        Ok(abstracts_from_openalex_works(&json, dois))
     }
 
-    async fn openreview_accepted_abstracts_from(
+    async fn semantic_scholar_doi_abstracts(
         &self,
-        base: &str,
-        venue_id: &str,
-    ) -> std::result::Result<HashMap<String, String>, String> {
-        let mut out = HashMap::new();
-        let mut offset = 0usize;
-        loop {
-            let req = self.openreview_get(base).await.query(&[
-                ("content.venueid", venue_id),
-                ("limit", &OPENREVIEW_PAGE_SIZE.to_string()),
-                ("offset", &offset.to_string()),
-            ]);
-            let json = self.fetch_json(req).await?;
-            let page_len = json
-                .get("notes")
-                .and_then(|v| v.as_array())
-                .map_or(0, Vec::len);
-            out.extend(abstracts_from_openreview_notes(&json));
-            if page_len < OPENREVIEW_PAGE_SIZE {
-                break;
-            }
-            offset += OPENREVIEW_PAGE_SIZE;
+        dois: &[String],
+    ) -> Result<HashMap<String, String>> {
+        let ids = dois
+            .iter()
+            .map(|doi| format!("DOI:{doi}"))
+            .collect::<Vec<_>>();
+        let req = self
+            .client
+            .post("https://api.semanticscholar.org/graph/v1/paper/batch")
+            .query(&[("fields", "externalIds,abstract")])
+            .json(&serde_json::json!({ "ids": ids }));
+        let req = match &self.secrets.semantic_scholar_key {
+            Some(key) => req.header("x-api-key", key),
+            None => req,
+        };
+        let json = self
+            .fetch_json_no_retry(req)
+            .await
+            .map_err(crate::Error::Other)?;
+        Ok(abstracts_from_semantic_scholar_batch(&json, dois))
+    }
+
+    async fn api_by_title(&self, paper: &Paper) -> Result<Option<String>> {
+        if let EnrichResult::Found(abs) = self
+            .fetch_openalex_abstract(
+                "https://api.openalex.org/works",
+                &[("search", paper.title.as_str()), ("per-page", "10")],
+                |json| abstract_from_openalex_title_search(json, paper),
+            )
+            .await
+        {
+            return Ok(Some(abs));
         }
-        Ok(out)
+
+        let s2_req = {
+            let req = self
+                .client
+                .get("https://api.semanticscholar.org/graph/v1/paper/search/match")
+                .query(&[
+                    ("query", paper.title.as_str()),
+                    ("limit", "5"),
+                    ("fields", "title,year,authors,abstract"),
+                ]);
+            match &self.secrets.semantic_scholar_key {
+                Some(key) => req.header("x-api-key", key),
+                None => req,
+            }
+        };
+        Ok(
+            match self
+                .fetch_abstract_no_retry(s2_req, |json| {
+                    abstract_from_semantic_scholar_title_search(json, paper)
+                })
+                .await
+            {
+                EnrichResult::Found(abs) => Some(abs),
+                EnrichResult::Missing(_) => None,
+            },
+        )
     }
 
     async fn openreview_api_abstract(&self, url: &str) -> Option<String> {
@@ -500,6 +777,59 @@ impl Enricher {
             }
         }
         None
+    }
+
+    async fn openreview_accepted_abstracts(
+        &self,
+        venue: &str,
+        year: i32,
+    ) -> Result<HashMap<String, String>> {
+        let venue_id = format!("{venue}.cc/{year}/Conference");
+        let mut last_err = None;
+        for base in [
+            "https://api2.openreview.net/notes",
+            "https://api.openreview.net/notes",
+        ] {
+            match self
+                .openreview_accepted_abstracts_from(base, &venue_id)
+                .await
+            {
+                Ok(abstracts) if !abstracts.is_empty() => return Ok(abstracts),
+                Ok(_) => {}
+                Err(e) => last_err = Some(e),
+            }
+        }
+        match last_err {
+            Some(e) => Err(e),
+            None => Ok(HashMap::new()),
+        }
+    }
+
+    async fn openreview_accepted_abstracts_from(
+        &self,
+        base: &str,
+        venue_id: &str,
+    ) -> Result<HashMap<String, String>> {
+        let mut out = HashMap::new();
+        let mut offset = 0usize;
+        loop {
+            let req = self.openreview_get(base).await.query(&[
+                ("content.venueid", venue_id),
+                ("limit", &OPENREVIEW_PAGE_SIZE.to_string()),
+                ("offset", &offset.to_string()),
+            ]);
+            let json = self.fetch_json(req).await.map_err(crate::Error::Other)?;
+            let page_len = json
+                .get("notes")
+                .and_then(|v| v.as_array())
+                .map_or(0, Vec::len);
+            out.extend(abstracts_from_openreview_notes(&json));
+            if page_len < OPENREVIEW_PAGE_SIZE {
+                break;
+            }
+            offset += OPENREVIEW_PAGE_SIZE;
+        }
+        Ok(out)
     }
 
     async fn openreview_get(&self, url: &str) -> reqwest::RequestBuilder {
@@ -534,7 +864,7 @@ impl Enricher {
                 "password": password,
                 "expiresIn": OPENREVIEW_LOGIN_EXPIRES_IN,
             }));
-        let json = self.fetch_json(req).await.ok()?;
+        let json = self.fetch_json_no_retry(req).await.ok()?;
         json.get("token")
             .and_then(|token| token.as_str())
             .map(str::to_string)
@@ -555,7 +885,24 @@ impl Enricher {
         req: reqwest::RequestBuilder,
         extract: impl Fn(&Value) -> Option<String>,
     ) -> EnrichResult {
-        let json = match self.fetch_json(req).await {
+        self.fetch_abstract_inner(req, extract, true).await
+    }
+
+    async fn fetch_abstract_no_retry(
+        &self,
+        req: reqwest::RequestBuilder,
+        extract: impl Fn(&Value) -> Option<String>,
+    ) -> EnrichResult {
+        self.fetch_abstract_inner(req, extract, false).await
+    }
+
+    async fn fetch_abstract_inner(
+        &self,
+        req: reqwest::RequestBuilder,
+        extract: impl Fn(&Value) -> Option<String>,
+        retry_rate_limits: bool,
+    ) -> EnrichResult {
+        let json = match self.fetch_json_inner(req, retry_rate_limits).await {
             Ok(json) => json,
             Err(reason) => return EnrichResult::Missing(reason),
         };
@@ -566,12 +913,64 @@ impl Enricher {
     }
 
     async fn fetch_json(&self, req: reqwest::RequestBuilder) -> std::result::Result<Value, String> {
+        self.fetch_json_inner(req, true).await
+    }
+
+    async fn fetch_json_no_retry(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> std::result::Result<Value, String> {
+        self.fetch_json_inner(req, false).await
+    }
+
+    async fn fetch_openalex_abstract(
+        &self,
+        url: &str,
+        query: &[(&str, &str)],
+        extract: impl Fn(&Value) -> Option<String>,
+    ) -> EnrichResult {
+        let json = match self.fetch_openalex_json(url, query).await {
+            Ok(json) => json,
+            Err(reason) => return EnrichResult::Missing(reason),
+        };
+        match extract(&json) {
+            Some(abs) => EnrichResult::Found(abs),
+            None => EnrichResult::Missing("response had no extractable abstract".into()),
+        }
+    }
+
+    async fn fetch_openalex_json(
+        &self,
+        url: &str,
+        query: &[(&str, &str)],
+    ) -> std::result::Result<Value, String> {
+        let plain_req = || self.client.get(url).query(query);
+        let req = match &self.secrets.openalex_api_key {
+            Some(key) => plain_req().query(&[("api_key", key.as_str())]),
+            None => plain_req(),
+        };
+        match self.fetch_json_no_retry(req).await {
+            Err(reason)
+                if self.secrets.openalex_api_key.is_some()
+                    && should_retry_openalex_without_key(&reason) =>
+            {
+                self.fetch_json_no_retry(plain_req()).await
+            }
+            other => other,
+        }
+    }
+
+    async fn fetch_json_inner(
+        &self,
+        req: reqwest::RequestBuilder,
+        retry_rate_limits: bool,
+    ) -> std::result::Result<Value, String> {
         let retry_req = req.try_clone();
         let mut resp = match req.send().await {
             Ok(resp) => resp,
             Err(_) => return Err("request failed".into()),
         };
-        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        if retry_rate_limits && resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             if let Some(req) = retry_req {
                 tokio::time::sleep(rate_limit_delay(&resp)).await;
                 resp = match req.send().await {
@@ -693,6 +1092,11 @@ fn cached_openreview_abstract(
         .cloned()
 }
 
+fn cached_doi_abstract(cache: &HashMap<String, Option<String>>, paper: &Paper) -> Option<String> {
+    let doi = paper.doi.as_deref().and_then(normalized_doi)?;
+    cache.get(&doi).cloned().flatten()
+}
+
 fn http_status_reason(prefix: &str, status: reqwest::StatusCode) -> String {
     let label = match status.as_u16() {
         401 | 403 => "blocked",
@@ -701,6 +1105,12 @@ fn http_status_reason(prefix: &str, status: reqwest::StatusCode) -> String {
         _ => "request failed",
     };
     format!("{prefix} {} ({label})", status.as_u16())
+}
+
+fn should_retry_openalex_without_key(reason: &str) -> bool {
+    reason.starts_with("HTTP 401")
+        || reason.starts_with("HTTP 403")
+        || reason.starts_with("HTTP 429")
 }
 
 fn rate_limit_delay(resp: &reqwest::Response) -> Duration {
@@ -834,6 +1244,19 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn paper(title: &str) -> Paper {
+        Paper {
+            dblp_key: "conf/iclr/example".into(),
+            venue: "ICLR".into(),
+            year: 2024,
+            title: title.into(),
+            authors: "Nicklas Hansen, Hao Su, Xiaolong Wang".into(),
+            doi: None,
+            url: Some("https://openreview.net/forum?id=Oxh5CstDJU".into()),
+            abstract_text: None,
+        }
+    }
+
     #[test]
     fn http_status_reason_labels_blocked_and_rate_limited() {
         assert_eq!(
@@ -844,6 +1267,15 @@ mod tests {
             http_status_reason("static scrape HTTP", reqwest::StatusCode::FORBIDDEN),
             "static scrape HTTP 403 (blocked)"
         );
+    }
+
+    #[test]
+    fn openalex_key_retry_is_limited_to_auth_or_rate_statuses() {
+        assert!(should_retry_openalex_without_key("HTTP 429 (rate limited)"));
+        assert!(should_retry_openalex_without_key("HTTP 403 (blocked)"));
+        assert!(!should_retry_openalex_without_key(
+            "HTTP 404 (request failed)"
+        ));
     }
 
     #[test]
@@ -872,6 +1304,94 @@ mod tests {
         assert_eq!(
             abstract_from_openalex(&work).as_deref(),
             Some("direct text")
+        );
+    }
+
+    #[test]
+    fn doi_batch_helpers_require_exact_doi_match() {
+        let dois = vec!["10.1000/right".to_string()];
+        let openalex = json!({
+            "results": [
+                {"doi": "https://doi.org/10.1000/wrong", "abstract": "wrong"},
+                {"doi": "https://doi.org/10.1000/right", "abstract": "right"}
+            ]
+        });
+        assert_eq!(
+            abstracts_from_openalex_works(&openalex, &dois)
+                .get("10.1000/right")
+                .map(String::as_str),
+            Some("right")
+        );
+
+        let s2 = json!([
+            {"externalIds": {"DOI": "10.1000/wrong"}, "abstract": "wrong"},
+            {"externalIds": {"DOI": "10.1000/right"}, "abstract": "right"}
+        ]);
+        assert_eq!(
+            abstracts_from_semantic_scholar_batch(&s2, &dois)
+                .get("10.1000/right")
+                .map(String::as_str),
+            Some("right")
+        );
+    }
+
+    #[test]
+    fn openalex_title_search_requires_identity_match() {
+        let results = json!({
+            "results": [
+                {
+                    "title": "TD-MPC2: Scalable, Robust World Models for Continuous Control",
+                    "publication_year": 2024,
+                    "authorships": [{"author": {"display_name": "Wrong Author"}}],
+                    "abstract": "wrong author"
+                },
+                {
+                    "title": "TD-MPC2: Scalable, Robust World Models for Continuous Control",
+                    "publication_year": 2023,
+                    "authorships": [{"author": {"display_name": "Nicklas Hansen"}}],
+                    "abstract": "right"
+                }
+            ]
+        });
+        assert_eq!(
+            abstract_from_openalex_title_search(
+                &results,
+                &paper("TD-MPC2: Scalable, Robust World Models for Continuous Control.")
+            )
+            .as_deref(),
+            Some("right")
+        );
+        assert_eq!(
+            abstract_from_openalex_title_search(&results, &paper("Different Title")),
+            None
+        );
+    }
+
+    #[test]
+    fn semantic_scholar_title_search_requires_identity_match() {
+        let results = json!({
+            "data": [
+                {
+                    "title": "TD-MPC2: Scalable, Robust World Models for Continuous Control",
+                    "year": 2024,
+                    "authors": [{"name": "Wrong Author"}],
+                    "abstract": "wrong author"
+                },
+                {
+                    "title": "TD-MPC2: Scalable, Robust World Models for Continuous Control",
+                    "year": 2023,
+                    "authors": [{"name": "Nicklas Hansen"}],
+                    "abstract": "right"
+                }
+            ]
+        });
+        assert_eq!(
+            abstract_from_semantic_scholar_title_search(
+                &results,
+                &paper("TD-MPC2: Scalable, Robust World Models for Continuous Control.")
+            )
+            .as_deref(),
+            Some("right")
         );
     }
 
@@ -912,12 +1432,92 @@ mod tests {
     }
 
     #[test]
+    fn cached_openreview_abstract_uses_forum_id() {
+        let mut cache = HashMap::new();
+        cache.insert(
+            ("ICLR".to_string(), 2024),
+            HashMap::from([("Oxh5CstDJU".to_string(), "cached abstract".to_string())]),
+        );
+        assert_eq!(
+            cached_openreview_abstract(
+                &cache,
+                &paper("TD-MPC2: Scalable, Robust World Models for Continuous Control.")
+            )
+            .as_deref(),
+            Some("cached abstract")
+        );
+        let mut pmlr = paper("TD-MPC2: Scalable, Robust World Models for Continuous Control.");
+        pmlr.url = Some("https://proceedings.mlr.press/v1/example.html".into());
+        assert_eq!(cached_openreview_abstract(&cache, &pmlr), None);
+    }
+
+    #[tokio::test]
+    async fn enrich_many_uses_cached_openreview_abstracts() {
+        let mut enricher = Enricher::new(Secrets::default());
+        enricher.openreview_cache.insert(
+            ("ICLR".to_string(), 2024),
+            HashMap::from([("Oxh5CstDJU".to_string(), "cached abstract".to_string())]),
+        );
+
+        let results = enricher
+            .enrich_many(
+                vec![paper(
+                    "TD-MPC2: Scalable, Robust World Models for Continuous Control.",
+                )],
+                1,
+            )
+            .await;
+
+        let (_, result) = results.into_iter().next().unwrap();
+        match result.unwrap() {
+            EnrichResult::Found(abs) => assert_eq!(abs, "cached abstract"),
+            EnrichResult::Missing(reason) => panic!("expected cached abstract, got {reason}"),
+        }
+    }
+
+    #[test]
     fn openreview_forum_id_from_url() {
         assert_eq!(
             openreview_forum_id("https://openreview.net/forum?id=8EtSBX41mt").as_deref(),
             Some("8EtSBX41mt")
         );
         assert!(openreview_forum_id("https://example.com/forum?id=8EtSBX41mt").is_none());
+    }
+
+    #[test]
+    fn static_source_uses_resolved_url_provider() {
+        assert_eq!(
+            source_from_static_url(&Url::parse("https://www.usenix.org/conference/x").unwrap()),
+            Some(AbstractSource::Usenix)
+        );
+        assert_eq!(
+            source_from_static_url(&Url::parse("https://dl.acm.org/doi/10.1145/x").unwrap()),
+            Some(AbstractSource::Acm)
+        );
+        assert_eq!(
+            source_from_static_url(&Url::parse("https://example.com/paper").unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn paper_url_source_handles_mixed_provider_venues() {
+        assert_eq!(
+            source_from_paper_url("https://www.usenix.org/conference/raid2019/presentation/chiba"),
+            Some(AbstractSource::Usenix)
+        );
+        assert_eq!(
+            source_from_paper_url("https://doi.org/10.1007/978-3-030-00470-5_1"),
+            Some(AbstractSource::Springer)
+        );
+        assert_eq!(
+            source_from_paper_url("https://doi.org/10.1145/3678890.3678926"),
+            Some(AbstractSource::Acm)
+        );
+        assert_eq!(
+            source_from_paper_url("https://doi.org/10.1109/RAID67961.2025.00012"),
+            Some(AbstractSource::Ieee)
+        );
     }
 
     #[test]
@@ -983,6 +1583,18 @@ mod tests {
         assert_eq!(
             extract_abstract_html(html, Some(AbstractSource::Neurips)).as_deref(),
             Some("NeurIPS abstract text.")
+        );
+    }
+
+    #[test]
+    fn html_neurips_datasets_benchmarks_abstract() {
+        let html = r#"<html><body>
+            <h4>Abstract</h4>
+            <p><p>Datasets and Benchmarks abstract text.</p></p>
+        </body></html>"#;
+        assert_eq!(
+            extract_abstract_html(html, Some(AbstractSource::Neurips)).as_deref(),
+            Some("Datasets and Benchmarks abstract text.")
         );
     }
 

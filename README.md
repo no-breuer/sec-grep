@@ -69,16 +69,8 @@ sec-grep 'malware detection' --year 2022- --rank A --rank 'A*' --sort year
 # Export matching papers as BibTeX
 sec-grep 'kernel fuzz*' --venue USENIX-SEC --format bibtex > papers.bib
 
-# Script-friendly CSV with selected columns
-sec-grep 'large language model' --tag ml \
-  --format csv \
-  --fields venue,year,title,authors,url
-
-# ML papers across NeurIPS, ICML, ICLR, AISec, and SaTML
-sec-grep 'mechanistic interpretability' --tag ml --year 2023-
-
-# AI-security crossover papers
-sec-grep 'prompt injection OR jailbreak' --tag ai-security
+# Script-friendly JSON output
+sec-grep 'large language model' --year 2023- --format json
 
 # Limit output for quick triage
 sec-grep 'ransomware OR botnet' --year 2020- --limit 20
@@ -123,7 +115,14 @@ engineering. Tags filter papers within the indexed corpus.
 ```sh
 sec-grep update --bundle security,ml
 sec-grep enrich --bundle ml
+```
+
+```sh
+# ML venue papers
 sec-grep 'mechanistic interpretability' --tag ml --year 2023-
+
+# AI-security crossover papers
+sec-grep 'prompt injection OR jailbreak' --tag ai-security
 ```
 
 ## Venues
@@ -170,8 +169,8 @@ sec-grep 'malware' --venue DIMVA
 
 ## Abstracts
 
-Abstract enrichment is optional, cached, and best-effort. sec-grep first tries
-DOI-based APIs, then falls back to static publisher-page parsers.
+Abstract enrichment is optional, cached, and best-effort. sec-grep uses paper
+DOIs and DBLP paper URLs to find abstracts.
 
 ```sh
 sec-grep update --abstracts
@@ -182,8 +181,8 @@ No API keys are required, but keys can improve rate limits and coverage.
 
 | Variable | Used for | Get a key |
 |---|---|---|
-| `OPENALEX_API_KEY` | OpenAlex DOI lookup | [openalex.org/settings/api](https://openalex.org/settings/api) |
-| `SEMANTIC_SCHOLAR_S2_KEY` | Semantic Scholar DOI lookup | [semanticscholar.org/product/api](https://www.semanticscholar.org/product/api) |
+| `OPENALEX_API_KEY` | OpenAlex lookups | [openalex.org/settings/api](https://openalex.org/settings/api) |
+| `SEMANTIC_SCHOLAR_S2_KEY` | Semantic Scholar lookups | [semanticscholar.org/product/api](https://www.semanticscholar.org/product/api) |
 | `OPENREVIEW_USERNAME` / `OPENREVIEW_PASSWORD` | OpenReview lookups | [OpenReview API docs](https://docs.openreview.net/getting-started/using-the-api/installing-and-instantiating-the-python-client) |
 
 Set them in the shell:
