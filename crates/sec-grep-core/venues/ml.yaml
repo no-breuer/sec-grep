@@ -28,30 +28,35 @@ venues:
     aliases: [acl]
     rank: A*
     tags: [nlp, computational-linguistics, ml]
+
   - id: EMNLP
     name: Conference on Empirical Methods in Natural Language Processing
     dblp_stream: conf/emnlp
     aliases: [emnlp]
     rank: A*
     tags: [nlp, empirical-methods, ml]
+
   - id: CVPR
     name: IEEE/CVF Conference on Computer Vision and Pattern Recognition
     dblp_stream: conf/cvpr
     aliases: [cvpr]
     rank: A*
-    tags: [computer-vision, pattern-recognition, deepfake]
+    tags: [ml, computer-vision, pattern-recognition]
+
   - id: ICCV
     name: IEEE/CVF International Conference on Computer Vision
     dblp_stream: conf/iccv
     aliases: [iccv]
     rank: A*
-    tags: [computer-vision, pattern-recognition, deepfake]
-  - id: ICJAI
+    tags: [ml, computer-vision, pattern-recognition]
+
+  - id: IJCAI
     name: International Joint Conference on Artificial Intelligence
     dblp_stream: conf/ijcai
     aliases: [ijcai]
     rank: A*
     tags: [artificial-intelligence, ai, machine-learning, ml]
+
   - id: AAAI
     name: AAAI Conference on Artificial Intelligence
     dblp_stream: conf/aaai
