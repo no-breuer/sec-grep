@@ -446,30 +446,41 @@ mod tests {
     #[test]
     fn default_catalog_has_security_and_ml_venue_groups() {
         let cfg = Config::defaults().unwrap();
-        assert_eq!(
-            cfg.venues_by_tag(&["security".into()]),
-            vec![
-                "NDSS".to_string(),
-                "USENIX-SEC".to_string(),
-                "SP".to_string(),
-                "CCS".to_string(),
-                "RAID".to_string(),
-                "ACSAC".to_string(),
-                "ESORICS".to_string(),
-                "AsiaCCS".to_string(),
-                "EuroSP".to_string(),
-            ]
-        );
-        assert_eq!(
-            cfg.venues_by_tag(&["ml".into()]),
-            vec![
-                "AISec".to_string(),
-                "SaTML".to_string(),
-                "NeurIPS".to_string(),
-                "ICML".to_string(),
-                "ICLR".to_string(),
-            ]
-        );
+        let security = cfg.venues_by_tag(&["security".into()]);
+        for expected in [
+            "NDSS",
+            "USENIX-SEC",
+            "SP",
+            "CCS",
+            "RAID",
+            "ACSAC",
+            "ESORICS",
+            "AsiaCCS",
+            "EuroSP",
+        ] {
+            assert!(
+                security.iter().any(|id| id == expected),
+                "missing {expected}"
+            );
+        }
+
+        let ml = cfg.venues_by_tag(&["ml".into()]);
+        for expected in ["AISec", "SaTML", "NeurIPS", "ICML", "ICLR"] {
+            assert!(ml.iter().any(|id| id == expected), "missing {expected}");
+        }
+
+        let (_, yaml) = BUNDLED_VENUES
+            .iter()
+            .find(|(bundle, _)| *bundle == "ml")
+            .unwrap();
+        let bundle_file: BundleFile = serde_yaml::from_str(yaml).unwrap();
+        for venue in bundle_file.venues {
+            assert!(
+                venue.tags.iter().any(|tag| tag == "ml"),
+                "ML bundle venue {} is missing the ml tag",
+                venue.id
+            );
+        }
     }
 
     #[test]
@@ -478,6 +489,7 @@ mod tests {
         assert_eq!(cfg.venue("oakland").unwrap().id, "SP");
         assert_eq!(cfg.venue("USENIX").unwrap().id, "USENIX-SEC");
         assert_eq!(cfg.venue("Ndss").unwrap().id, "NDSS");
+        assert_eq!(cfg.venue("ijcai").unwrap().id, "IJCAI");
         assert!(cfg.venue("nope").is_none());
     }
 
