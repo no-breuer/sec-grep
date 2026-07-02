@@ -32,7 +32,9 @@ const DOI_BATCH_SIZE: usize = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum AbstractSource {
+    Acl,
     Acm,
+    Cvf,
     Ieee,
     Ndss,
     Neurips,
@@ -46,9 +48,7 @@ enum AbstractSource {
 /// or read a plain `abstract` string if present.
 fn abstract_from_openalex(work: &Value) -> Option<String> {
     if let Some(s) = work.get("abstract").and_then(|v| v.as_str()) {
-        if !s.trim().is_empty() {
-            return Some(s.trim().to_string());
-        }
+        return non_empty_text(s);
     }
     let idx = work.get("abstract_inverted_index")?.as_object()?;
     let mut positioned: Vec<(u64, &str)> = Vec::new();
@@ -63,7 +63,7 @@ fn abstract_from_openalex(work: &Value) -> Option<String> {
         return None;
     }
     positioned.sort_by_key(|(p, _)| *p);
-    Some(
+    non_empty_text(
         positioned
             .into_iter()
             .map(|(_, w)| w)
@@ -76,9 +76,7 @@ fn abstract_from_semantic_scholar(paper: &Value) -> Option<String> {
     paper
         .get("abstract")
         .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+        .and_then(non_empty_text)
 }
 
 fn abstract_from_openalex_title_search(results: &Value, paper: &Paper) -> Option<String> {
@@ -272,9 +270,11 @@ fn extract_abstract_html(html: &str, source: Option<AbstractSource>) -> Option<S
     let doc = Html::parse_document(html);
 
     let source_hit = match source {
+        Some(AbstractSource::Acl) => first_selector_text(&doc, &[".acl-abstract span"]),
         Some(AbstractSource::Acm) => {
             first_selector_text(&doc, &["div.abstractInFull", "div.abstractSection"])
         }
+        Some(AbstractSource::Cvf) => first_selector_text(&doc, &["div#abstract"]),
         Some(AbstractSource::Ieee) => first_selector_text(&doc, &["div.abstract-text"]),
         Some(AbstractSource::Ndss) => extract_ndss_abstract(&doc),
         Some(AbstractSource::Neurips) => extract_neurips_abstract(&doc),
@@ -297,7 +297,11 @@ fn extract_abstract_html(html: &str, source: Option<AbstractSource>) -> Option<S
         _ => None,
     };
 
-    source_hit.or_else(|| first_meta_content(&doc))
+    if source == Some(AbstractSource::Acl) {
+        source_hit
+    } else {
+        source_hit.or_else(|| first_meta_content(&doc))
+    }
 }
 
 fn extract_ndss_abstract(doc: &Html) -> Option<String> {
@@ -377,6 +381,16 @@ fn first_meta_content(doc: &Html) -> Option<String> {
 
 fn is_boilerplate_abstract(text: &str) -> bool {
     text.starts_with("Promoting openness in scientific communication and the peer-review process")
+        || text.starts_with("Electronic proceedings of ")
+        || ((text.contains("Proceedings of ") || text.contains("Findings of "))
+            && ends_with_year_citation(text))
+}
+
+fn ends_with_year_citation(text: &str) -> bool {
+    let Some(year) = text.trim_end_matches('.').rsplit(' ').next() else {
+        return false;
+    };
+    year.len() == 4 && year.chars().all(|c| c.is_ascii_digit())
 }
 
 fn element_text(element: ElementRef) -> Option<String> {
@@ -386,8 +400,15 @@ fn element_text(element: ElementRef) -> Option<String> {
 fn non_empty_text(text: impl AsRef<str>) -> Option<String> {
     let decoded = decode_html_entities(text.as_ref());
     let decoded = decode_html_entities(&decoded);
-    let text = collapse_ws(&decoded);
-    (!text.is_empty()).then_some(text)
+    let text = strip_abstract_heading(&collapse_ws(&decoded)).to_string();
+    (text.chars().any(char::is_alphabetic) && !is_boilerplate_abstract(&text)).then_some(text)
+}
+
+fn strip_abstract_heading(text: &str) -> &str {
+    ["Abstract:", "Abstract -", "Abstract –", "Abstract —"]
+        .iter()
+        .find_map(|prefix| text.strip_prefix(prefix).map(str::trim_start))
+        .unwrap_or(text)
 }
 
 fn decode_html_entities(s: &str) -> String {
@@ -981,8 +1002,10 @@ impl Enricher {
 fn source_from_static_url(url: &Url) -> Option<AbstractSource> {
     let host = url.host_str()?.trim_end_matches('.').to_ascii_lowercase();
     match host.as_str() {
+        "aclanthology.org" | "www.aclanthology.org" => Some(AbstractSource::Acl),
         "dl.acm.org" => Some(AbstractSource::Acm),
         "ieeexplore.ieee.org" => Some(AbstractSource::Ieee),
+        "openaccess.thecvf.com" => Some(AbstractSource::Cvf),
         "openreview.net" | "www.openreview.net" => Some(AbstractSource::Openreview),
         "proceedings.mlr.press" => Some(AbstractSource::Pmlr),
         "neurips.cc" => Some(AbstractSource::Neurips),
@@ -1007,6 +1030,7 @@ fn source_from_doi_url(url: &Url) -> Option<AbstractSource> {
     let doi = url.path().trim_start_matches('/').to_ascii_lowercase();
     match doi.as_str() {
         doi if doi.starts_with("10.1145/") => Some(AbstractSource::Acm),
+        doi if doi.starts_with("10.18653/") => Some(AbstractSource::Acl),
         doi if doi.starts_with("10.1109/") => Some(AbstractSource::Ieee),
         doi if doi.starts_with("10.1007/") => Some(AbstractSource::Springer),
         doi if doi.starts_with("10.14722/") => Some(AbstractSource::Ndss),
@@ -1245,6 +1269,14 @@ mod tests {
             abstract_from_openalex(&work).as_deref(),
             Some("direct text")
         );
+        let citation = json!({
+            "abstract": "Alice Example. Proceedings of the 2024 Conference. 2024."
+        });
+        assert!(abstract_from_openalex(&citation).is_none());
+        let findings = json!({
+            "abstract": "Alice Example. Findings of the Association for Computational Linguistics: EMNLP 2024. 2024."
+        });
+        assert!(abstract_from_openalex(&findings).is_none());
     }
 
     #[test]
@@ -1342,6 +1374,10 @@ mod tests {
             Some("hello")
         );
         assert!(abstract_from_semantic_scholar(&json!({"abstract": null})).is_none());
+        assert!(abstract_from_semantic_scholar(
+            &json!({"abstract": "Alice Example. Proceedings of the 2024 Conference. 2024."})
+        )
+        .is_none());
     }
 
     #[test]
@@ -1435,6 +1471,10 @@ mod tests {
             Some(AbstractSource::Acm)
         );
         assert_eq!(
+            source_from_static_url(&Url::parse("https://aclanthology.org/D19-1593/").unwrap()),
+            Some(AbstractSource::Acl)
+        );
+        assert_eq!(
             source_from_static_url(&Url::parse("https://example.com/paper").unwrap()),
             None
         );
@@ -1453,6 +1493,10 @@ mod tests {
         assert_eq!(
             source_from_paper_url("https://doi.org/10.1145/3678890.3678926"),
             Some(AbstractSource::Acm)
+        );
+        assert_eq!(
+            source_from_paper_url("https://doi.org/10.18653/V1/D19-1593"),
+            Some(AbstractSource::Acl)
         );
         assert_eq!(
             source_from_paper_url("https://doi.org/10.1109/RAID67961.2025.00012"),
@@ -1478,6 +1522,28 @@ mod tests {
             extract_abstract_html(html, Some(AbstractSource::Acm)).as_deref(),
             Some("This is the ACM abstract.")
         );
+    }
+
+    #[test]
+    fn html_acl_source_specific_selector() {
+        let html = r#"<html><body>
+            <meta property="og:description" content="Alice. Proceedings of the 2024 Conference. 2024.">
+            <div class="card-body acl-abstract">
+                <h5>Abstract</h5><span>This is the ACL abstract.</span>
+            </div>
+        </body></html>"#;
+        assert_eq!(
+            extract_abstract_html(html, Some(AbstractSource::Acl)).as_deref(),
+            Some("This is the ACL abstract.")
+        );
+    }
+
+    #[test]
+    fn html_acl_source_ignores_citation_meta() {
+        let html = r#"<html><head>
+            <meta property="og:description" content="Alice. Proceedings of the 2024 Conference. 2024.">
+        </head><body></body></html>"#;
+        assert!(extract_abstract_html(html, Some(AbstractSource::Acl)).is_none());
     }
 
     #[test]
@@ -1620,6 +1686,17 @@ mod tests {
     }
 
     #[test]
+    fn html_cvf_source_specific_selector() {
+        let html = r#"<html><body>
+            <div id="abstract">CVF-style abstract text.</div>
+        </body></html>"#;
+        assert_eq!(
+            extract_abstract_html(html, Some(AbstractSource::Cvf)).as_deref(),
+            Some("CVF-style abstract text.")
+        );
+    }
+
+    #[test]
     fn html_meta_fallback_decodes_entities() {
         let html = r#"<html><head>
             <meta property="og:description" content="A&amp;#160;B &amp;amp; C &#8217;">
@@ -1627,6 +1704,28 @@ mod tests {
         assert_eq!(
             extract_abstract_html(html, None).as_deref(),
             Some("A B & C ’")
+        );
+    }
+
+    #[test]
+    fn html_ignores_punctuation_only_text() {
+        assert!(non_empty_text(",").is_none());
+    }
+
+    #[test]
+    fn html_ignores_proceedings_boilerplate() {
+        assert!(non_empty_text("Electronic proceedings of IJCAI 2024").is_none());
+    }
+
+    #[test]
+    fn html_strips_abstract_heading_prefix() {
+        assert_eq!(
+            non_empty_text("Abstract: This is the real abstract.").as_deref(),
+            Some("This is the real abstract.")
+        );
+        assert_eq!(
+            non_empty_text("Abstract meaning representation is a graph.").as_deref(),
+            Some("Abstract meaning representation is a graph.")
         );
     }
 
