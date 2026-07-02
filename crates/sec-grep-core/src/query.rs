@@ -11,7 +11,6 @@
 //! Negation maps to FTS5's binary `x NOT y`, so a negated term must be
 //! combined with at least one positive term.
 
-use crate::config::{Config, VenueFilter};
 use crate::{Error, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,16 +56,6 @@ pub struct ParsedQuery {
     pub tag_selectors: Vec<String>,
     pub doi_terms: Vec<String>,
     pub year_ranges: Vec<YearRange>,
-}
-
-impl ParsedQuery {
-    pub fn resolve_venue_filter(&self, config: &Config) -> Result<VenueFilter> {
-        config.resolve_venue_filter(
-            &self.venue_selectors,
-            &self.rank_selectors,
-            &self.tag_selectors,
-        )
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

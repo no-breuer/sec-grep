@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use rusqlite::{params_from_iter, types::Value, Connection, OpenFlags, OptionalExtension, Row};
+use rusqlite::{params_from_iter, types::Value, Connection, OpenFlags, Row};
 
 use crate::config::{RankSortOrder, VenueFilter};
 use crate::query::YearRange;
@@ -253,18 +253,6 @@ impl Database {
             .query_row(&sql, params_from_iter(parts.args.iter()), |r| r.get(0))?;
         Ok(count as usize)
     }
-
-    pub fn get_by_key(&self, dblp_key: &str) -> Result<Option<Paper>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT dblp_key, venue, year, title, authors, doi, url, abstract \
-                 FROM papers WHERE dblp_key = ?1",
-                [dblp_key],
-                row_to_paper,
-            )
-            .optional()?)
-    }
 }
 
 fn in_clause(column: &str, start: usize, value_count: usize) -> String {
@@ -334,10 +322,9 @@ fn order_clause(q: &Search, args: &mut Vec<Value>) -> String {
     match &q.sort {
         Sort::Relevance if q.fts.is_some() => "ORDER BY bm25(papers_fts), p.year DESC".to_string(),
         Sort::Venue => "ORDER BY p.venue ASC, p.year DESC".to_string(),
-        Sort::Rank(order) if !order.is_empty() => {
-            let groups = order.groups();
-            let rank_expr = rank_groups_clause("p.venue", args.len() + 1, groups);
-            for venues in groups {
+        Sort::Rank(order) if order.iter().any(|venues| !venues.is_empty()) => {
+            let rank_expr = rank_groups_clause("p.venue", args.len() + 1, order);
+            for venues in order {
                 append_string_args(args, venues);
             }
             format!("ORDER BY {rank_expr}, p.year DESC, p.venue ASC")
@@ -533,6 +520,14 @@ mod tests {
         db
     }
 
+    fn paper_by_key(db: &Database, key: &str) -> Paper {
+        db.search(&Search::default())
+            .unwrap()
+            .into_iter()
+            .find(|paper| paper.dblp_key == key)
+            .unwrap()
+    }
+
     #[test]
     fn schema_and_count() {
         let db = seeded();
@@ -551,7 +546,7 @@ mod tests {
         )])
         .unwrap();
         assert_eq!(db.count().unwrap(), 3);
-        let p = db.get_by_key("k1").unwrap().unwrap();
+        let p = paper_by_key(&db, "k1");
         assert_eq!(p.title, "Fuzzing the Linux kernel v2");
         assert_eq!(p.abstract_text.as_deref(), Some("we fuzz kernels"));
     }
@@ -643,10 +638,7 @@ mod tests {
         let db = seeded();
         let hits = db
             .search(&Search {
-                sort: Sort::Rank(RankSortOrder::new(vec![
-                    vec!["NDSS".into(), "SP".into()],
-                    vec!["CCS".into()],
-                ])),
+                sort: Sort::Rank(vec![vec!["NDSS".into(), "SP".into()], vec!["CCS".into()]]),
                 ..Default::default()
             })
             .unwrap();
@@ -655,6 +647,22 @@ mod tests {
             .map(|paper| paper.dblp_key.as_str())
             .collect::<Vec<_>>();
         assert_eq!(keys, vec!["k1", "k3", "k2"]);
+    }
+
+    #[test]
+    fn empty_rank_sort_groups_fall_back_to_year() {
+        let db = seeded();
+        let hits = db
+            .search(&Search {
+                sort: Sort::Rank(vec![vec![]]),
+                ..Default::default()
+            })
+            .unwrap();
+        let keys = hits
+            .iter()
+            .map(|paper| paper.dblp_key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec!["k2", "k1", "k3"]);
     }
 
     #[test]

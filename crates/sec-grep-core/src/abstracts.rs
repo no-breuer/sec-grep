@@ -451,6 +451,12 @@ pub enum EnrichResult {
     Missing(String),
 }
 
+#[derive(Clone, Copy)]
+enum RateLimitRetry {
+    Enabled,
+    Disabled,
+}
+
 impl Enricher {
     pub fn new(secrets: Secrets) -> Self {
         let client = reqwest::Client::builder()
@@ -637,13 +643,11 @@ impl Enricher {
     }
 
     async fn api_by_doi(&self, doi: &str) -> Result<Option<String>> {
-        if let EnrichResult::Found(abs) = self
-            .fetch_openalex_abstract(
-                &format!("https://api.openalex.org/works/doi:{doi}"),
-                &[],
-                abstract_from_openalex,
-            )
+        if let Some(abs) = self
+            .fetch_openalex_json(&format!("https://api.openalex.org/works/doi:{doi}"), &[])
             .await
+            .ok()
+            .and_then(|json| abstract_from_openalex(&json))
         {
             return Ok(Some(abs));
         }
@@ -657,9 +661,11 @@ impl Enricher {
                 None => req,
             }
         };
-        if let EnrichResult::Found(abs) = self
-            .fetch_abstract_no_retry(s2_req, abstract_from_semantic_scholar)
+        if let Some(abs) = self
+            .fetch_json(s2_req, RateLimitRetry::Disabled)
             .await
+            .ok()
+            .and_then(|json| abstract_from_semantic_scholar(&json))
         {
             return Ok(Some(abs));
         }
@@ -667,17 +673,11 @@ impl Enricher {
         let cr = self
             .client
             .get(format!("https://api.crossref.org/works/{doi}"));
-        Ok(
-            match self
-                .fetch_abstract(cr, |json| {
-                    json.get("message").and_then(abstract_from_crossref)
-                })
-                .await
-            {
-                EnrichResult::Found(abs) => Some(abs),
-                EnrichResult::Missing(_) => None,
-            },
-        )
+        Ok(self
+            .fetch_json(cr, RateLimitRetry::Enabled)
+            .await
+            .ok()
+            .and_then(|json| json.get("message").and_then(abstract_from_crossref)))
     }
 
     async fn openalex_doi_abstracts(&self, dois: &[String]) -> Result<HashMap<String, String>> {
@@ -711,20 +711,21 @@ impl Enricher {
             None => req,
         };
         let json = self
-            .fetch_json_no_retry(req)
+            .fetch_json(req, RateLimitRetry::Disabled)
             .await
             .map_err(crate::Error::Other)?;
         Ok(abstracts_from_semantic_scholar_batch(&json, dois))
     }
 
     async fn api_by_title(&self, paper: &Paper) -> Result<Option<String>> {
-        if let EnrichResult::Found(abs) = self
-            .fetch_openalex_abstract(
+        if let Some(abs) = self
+            .fetch_openalex_json(
                 "https://api.openalex.org/works",
                 &[("search", paper.title.as_str()), ("per-page", "10")],
-                |json| abstract_from_openalex_title_search(json, paper),
             )
             .await
+            .ok()
+            .and_then(|json| abstract_from_openalex_title_search(&json, paper))
         {
             return Ok(Some(abs));
         }
@@ -743,17 +744,11 @@ impl Enricher {
                 None => req,
             }
         };
-        Ok(
-            match self
-                .fetch_abstract_no_retry(s2_req, |json| {
-                    abstract_from_semantic_scholar_title_search(json, paper)
-                })
-                .await
-            {
-                EnrichResult::Found(abs) => Some(abs),
-                EnrichResult::Missing(_) => None,
-            },
-        )
+        Ok(self
+            .fetch_json(s2_req, RateLimitRetry::Disabled)
+            .await
+            .ok()
+            .and_then(|json| abstract_from_semantic_scholar_title_search(&json, paper)))
     }
 
     async fn openreview_api_abstract(&self, url: &str) -> Option<String> {
@@ -766,7 +761,7 @@ impl Enricher {
                 .openreview_get(base)
                 .await
                 .query(&[("id", forum_id.as_str())]);
-            let Ok(json) = self.fetch_json(req).await else {
+            let Ok(json) = self.fetch_json(req, RateLimitRetry::Enabled).await else {
                 continue;
             };
             if let Some(abs) = abstracts_from_openreview_notes(&json)
@@ -818,7 +813,10 @@ impl Enricher {
                 ("limit", &OPENREVIEW_PAGE_SIZE.to_string()),
                 ("offset", &offset.to_string()),
             ]);
-            let json = self.fetch_json(req).await.map_err(crate::Error::Other)?;
+            let json = self
+                .fetch_json(req, RateLimitRetry::Enabled)
+                .await
+                .map_err(crate::Error::Other)?;
             let page_len = json
                 .get("notes")
                 .and_then(|v| v.as_array())
@@ -864,7 +862,7 @@ impl Enricher {
                 "password": password,
                 "expiresIn": OPENREVIEW_LOGIN_EXPIRES_IN,
             }));
-        let json = self.fetch_json_no_retry(req).await.ok()?;
+        let json = self.fetch_json(req, RateLimitRetry::Disabled).await.ok()?;
         json.get("token")
             .and_then(|token| token.as_str())
             .map(str::to_string)
@@ -879,66 +877,6 @@ impl Enricher {
         Ok(None)
     }
 
-    /// Send a request and run `extract` over the JSON body.
-    async fn fetch_abstract(
-        &self,
-        req: reqwest::RequestBuilder,
-        extract: impl Fn(&Value) -> Option<String>,
-    ) -> EnrichResult {
-        self.fetch_abstract_inner(req, extract, true).await
-    }
-
-    async fn fetch_abstract_no_retry(
-        &self,
-        req: reqwest::RequestBuilder,
-        extract: impl Fn(&Value) -> Option<String>,
-    ) -> EnrichResult {
-        self.fetch_abstract_inner(req, extract, false).await
-    }
-
-    async fn fetch_abstract_inner(
-        &self,
-        req: reqwest::RequestBuilder,
-        extract: impl Fn(&Value) -> Option<String>,
-        retry_rate_limits: bool,
-    ) -> EnrichResult {
-        let json = match self.fetch_json_inner(req, retry_rate_limits).await {
-            Ok(json) => json,
-            Err(reason) => return EnrichResult::Missing(reason),
-        };
-        match extract(&json) {
-            Some(abs) => EnrichResult::Found(abs),
-            None => EnrichResult::Missing("response had no extractable abstract".into()),
-        }
-    }
-
-    async fn fetch_json(&self, req: reqwest::RequestBuilder) -> std::result::Result<Value, String> {
-        self.fetch_json_inner(req, true).await
-    }
-
-    async fn fetch_json_no_retry(
-        &self,
-        req: reqwest::RequestBuilder,
-    ) -> std::result::Result<Value, String> {
-        self.fetch_json_inner(req, false).await
-    }
-
-    async fn fetch_openalex_abstract(
-        &self,
-        url: &str,
-        query: &[(&str, &str)],
-        extract: impl Fn(&Value) -> Option<String>,
-    ) -> EnrichResult {
-        let json = match self.fetch_openalex_json(url, query).await {
-            Ok(json) => json,
-            Err(reason) => return EnrichResult::Missing(reason),
-        };
-        match extract(&json) {
-            Some(abs) => EnrichResult::Found(abs),
-            None => EnrichResult::Missing("response had no extractable abstract".into()),
-        }
-    }
-
     async fn fetch_openalex_json(
         &self,
         url: &str,
@@ -949,28 +887,30 @@ impl Enricher {
             Some(key) => plain_req().query(&[("api_key", key.as_str())]),
             None => plain_req(),
         };
-        match self.fetch_json_no_retry(req).await {
+        match self.fetch_json(req, RateLimitRetry::Disabled).await {
             Err(reason)
                 if self.secrets.openalex_api_key.is_some()
                     && should_retry_openalex_without_key(&reason) =>
             {
-                self.fetch_json_no_retry(plain_req()).await
+                self.fetch_json(plain_req(), RateLimitRetry::Disabled).await
             }
             other => other,
         }
     }
 
-    async fn fetch_json_inner(
+    async fn fetch_json(
         &self,
         req: reqwest::RequestBuilder,
-        retry_rate_limits: bool,
+        retry_rate_limits: RateLimitRetry,
     ) -> std::result::Result<Value, String> {
         let retry_req = req.try_clone();
         let mut resp = match req.send().await {
             Ok(resp) => resp,
             Err(_) => return Err("request failed".into()),
         };
-        if retry_rate_limits && resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        if matches!(retry_rate_limits, RateLimitRetry::Enabled)
+            && resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+        {
             if let Some(req) = retry_req {
                 tokio::time::sleep(rate_limit_delay(&resp)).await;
                 resp = match req.send().await {

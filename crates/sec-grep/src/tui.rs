@@ -55,8 +55,7 @@ struct App {
 
 struct RankDisplay {
     ranks: HashMap<String, String>,
-    cells: HashMap<String, String>,
-    blank_cell: String,
+    width: usize,
 }
 
 impl RankDisplay {
@@ -75,29 +74,18 @@ impl RankDisplay {
             .max()
             .unwrap_or(0)
             .max(MIN_RANK_COL_WIDTH);
-        let cells = ranks
-            .iter()
-            .map(|(venue, rank)| {
-                let label = format!("[{rank}]");
-                (venue.clone(), format!("{label:<width$}"))
-            })
-            .collect();
-        Self {
-            ranks,
-            cells,
-            blank_cell: format!("{:<width$}", ""),
-        }
+        Self { ranks, width }
     }
 
     fn rank(&self, venue: &str) -> Option<&str> {
         self.ranks.get(venue).map(String::as_str)
     }
 
-    fn cell(&self, venue: &str) -> &str {
-        self.cells
-            .get(venue)
-            .map(String::as_str)
-            .unwrap_or(&self.blank_cell)
+    fn cell(&self, venue: &str) -> String {
+        match self.ranks.get(venue) {
+            Some(rank) => format!("{:<width$}", format!("[{rank}]"), width = self.width),
+            None => format!("{:<width$}", "", width = self.width),
+        }
     }
 }
 
@@ -677,10 +665,7 @@ fn result_item(rank_display: &RankDisplay, p: &Paper) -> ListItem<'static> {
         Span::raw(" "),
         Span::styled(format!("{:>4}", p.year), Style::default().fg(MUTED)),
         Span::raw(" "),
-        Span::styled(
-            rank_display.cell(&p.venue).to_string(),
-            Style::default().fg(DIM),
-        ),
+        Span::styled(rank_display.cell(&p.venue), Style::default().fg(DIM)),
         Span::raw("  "),
     ];
     spans.push(Span::styled(p.title.clone(), Style::default().fg(TEXT)));

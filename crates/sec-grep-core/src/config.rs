@@ -101,24 +101,7 @@ impl VenueFilter {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct RankSortOrder {
-    groups: Vec<Vec<String>>,
-}
-
-impl RankSortOrder {
-    pub fn new(groups: Vec<Vec<String>>) -> Self {
-        Self { groups }
-    }
-
-    pub fn groups(&self) -> &[Vec<String>] {
-        &self.groups
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.groups.iter().all(Vec::is_empty)
-    }
-}
+pub type RankSortOrder = Vec<Vec<String>>;
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct ConfigFile {
@@ -163,11 +146,6 @@ impl Config {
             defaults: Some(Defaults::default()),
             venues: Vec::new(),
         })?)
-    }
-
-    /// Load selected bundles, then merge a user config file if it exists.
-    pub fn load(user_override: Option<&Path>) -> Result<Self> {
-        Self::load_with_bundles(user_override, None)
     }
 
     pub fn load_with_bundles(
@@ -345,12 +323,10 @@ impl Config {
             });
         }
         groups.sort_by_key(|group| (group.sort_key, group.first_seen));
-        RankSortOrder::new(
-            groups
-                .into_iter()
-                .map(|group| self.venues_by_rank(std::slice::from_ref(&group.label)))
-                .collect(),
-        )
+        groups
+            .into_iter()
+            .map(|group| self.venues_by_rank(std::slice::from_ref(&group.label)))
+            .collect()
     }
 }
 
@@ -645,8 +621,7 @@ venues:
                 venue("UNRANKED", "", &[]),
             ],
         };
-        let order = cfg.rank_sort_order();
-        let groups = order.groups();
+        let groups = cfg.rank_sort_order();
         assert_eq!(
             groups.first(),
             Some(&vec!["ASTAR1".to_string(), "ASTAR2".to_string()])

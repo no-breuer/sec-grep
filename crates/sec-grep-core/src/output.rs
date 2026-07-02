@@ -188,11 +188,13 @@ fn bibtex(papers: &[Paper]) -> String {
         }
         let _ = writeln!(out, "@inproceedings{{{},", bibtex_key(&p.cite_key()));
         let _ = writeln!(out, "  title     = {{{}}},", bibtex_value(&p.title));
-        let _ = writeln!(
-            out,
-            "  author    = {{{}}},",
-            bibtex_value(&p.authors_bibtex())
-        );
+        let authors = p
+            .authors
+            .split(", ")
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" and ");
+        let _ = writeln!(out, "  author    = {{{}}},", bibtex_value(&authors));
         let _ = writeln!(out, "  booktitle = {{{}}},", bibtex_value(&p.venue));
         let _ = writeln!(out, "  year      = {{{}}},", p.year);
         if let Some(doi) = &p.doi {

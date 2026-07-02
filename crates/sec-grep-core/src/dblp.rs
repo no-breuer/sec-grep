@@ -11,36 +11,17 @@ pub const DEFAULT_ENDPOINT: &str = "https://sparql.dblp.org/sparql";
 const CONFERENCE_STREAM_PREFIX: &str = "conf/";
 const JOURNAL_STREAM_PREFIX: &str = "journals/";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DblpPublicationType {
-    Inproceedings,
-    Article,
-}
-
-impl DblpPublicationType {
-    fn as_dblp_type(self) -> &'static str {
-        match self {
-            DblpPublicationType::Inproceedings => "Inproceedings",
-            DblpPublicationType::Article => "Article",
-        }
-    }
-}
-
-fn publication_type_for_stream(stream: &str) -> Result<DblpPublicationType> {
-    if stream.starts_with(CONFERENCE_STREAM_PREFIX) {
-        Ok(DblpPublicationType::Inproceedings)
-    } else if stream.starts_with(JOURNAL_STREAM_PREFIX) {
-        Ok(DblpPublicationType::Article)
-    } else {
-        Err(Error::Config(format!(
-            "unsupported DBLP stream `{stream}`; expected `{CONFERENCE_STREAM_PREFIX}...` or `{JOURNAL_STREAM_PREFIX}...`"
-        )))
-    }
-}
-
 /// Build the SPARQL query for a single DBLP venue stream, bounded by year.
 pub fn build_query(stream: &str, min_year: i32, max_year: i32) -> Result<String> {
-    let publ_type = publication_type_for_stream(stream)?.as_dblp_type();
+    let publ_type = if stream.starts_with(CONFERENCE_STREAM_PREFIX) {
+        "Inproceedings"
+    } else if stream.starts_with(JOURNAL_STREAM_PREFIX) {
+        "Article"
+    } else {
+        return Err(Error::Config(format!(
+            "unsupported DBLP stream `{stream}`; expected `{CONFERENCE_STREAM_PREFIX}...` or `{JOURNAL_STREAM_PREFIX}...`"
+        )));
+    };
     Ok(format!(
         r#"PREFIX dblp: <https://dblp.org/rdf/schema#>
 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>

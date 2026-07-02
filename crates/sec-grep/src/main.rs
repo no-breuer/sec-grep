@@ -181,7 +181,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     reject_search_args_for_subcommands(&cli)?;
     let paths = Paths::resolve()?;
-    let config = load_config(&cli, &paths)?;
+    let config = load_config_with_bundles(&cli, &paths, None)?;
 
     match &cli.command {
         Some(Command::Init) => cmd_init(&cli, &paths),
@@ -214,24 +214,6 @@ fn log_field(label: &str, value: impl std::fmt::Display) {
 
 fn log_blank() {
     eprintln!();
-}
-
-fn write_stdout(out: &str) {
-    if out.is_empty() {
-        return;
-    }
-    print!("{out}");
-    if !out.ends_with('\n') {
-        println!();
-    }
-}
-
-fn flush_stderr() {
-    let _ = std::io::stderr().flush();
-}
-
-fn load_config(cli: &Cli, paths: &Paths) -> Result<Config> {
-    load_config_with_bundles(cli, paths, None)
 }
 
 fn load_config_with_bundles(
@@ -314,7 +296,12 @@ fn cmd_search(cli: &Cli, paths: &Paths, config: &Config) -> Result<()> {
     let format = cli.format.unwrap_or(Format::Table);
     let out =
         output::render(&papers, format, columns.as_deref()).map_err(|e| anyhow::anyhow!(e))?;
-    write_stdout(&out);
+    if !out.is_empty() {
+        print!("{out}");
+        if !out.ends_with('\n') {
+            println!();
+        }
+    }
     if matches!(format, Format::Table) {
         eprintln!("results    {}", papers.len());
     }
@@ -407,7 +394,7 @@ async fn cmd_update(args: &UpdateArgs, cli: &Cli, paths: &Paths, config: &Config
     for id in &venue_ids {
         let venue = config.venue(id).expect("resolved venue");
         eprint!("  {id:<12} ");
-        flush_stderr();
+        let _ = std::io::stderr().flush();
         match dblp.fetch_venue(venue, min_year, MAX_YEAR).await {
             Ok(papers) => {
                 let n = db.upsert_papers(&papers)?;
